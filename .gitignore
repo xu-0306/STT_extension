@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.pdb
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Node / JS
+node_modules/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.claude/
+.serena/
+
+# Local artifacts
+*.pt
+*.bin
+*.safetensors
+*.gguf
+Models/
+whisper-large-v3/
+
+# Audio / video captures
+*.mkv
+*.mp4
+*.webm
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.opus
+
+# Screenshots
+Screenshot*.png
+
+# Local scripts / shortcuts
+*.bat
+*.lnk
+
+# One-off local files
+nul
+1.txt
+backend/server_test.log

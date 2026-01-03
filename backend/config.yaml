@@ -1,0 +1,46 @@
+# Backend configuration for WhisperLiveKit server.
+
+server:
+  host: "127.0.0.1"
+  port: 8765
+
+stt:
+  model: "medium" # tiny, base, small, medium, large-v3
+  language: "auto" # auto, en, ja, zh
+  backend_policy: "simulstreaming" # simulstreaming or localagreement
+  backend: "auto" # auto, faster-whisper, whisper, openai-api
+  min_chunk_size: 0.1
+  buffer_trimming: "segment"
+  buffer_trimming_sec: 15
+  confidence_validation: false
+  pcm_input: false # false = webm/opus via MediaRecorder
+  vad: true
+  vac: true
+  vac_chunk_size: 0.04
+  simulstreaming:
+    frame_threshold: 25
+    beams: 1
+    decoder_type: null
+    audio_max_len: 30
+    audio_min_len: 0.0
+    cif_ckpt_path: null
+    never_fire: false
+    init_prompt: null
+    static_init_prompt: null
+    max_context_tokens: null
+
+translation:
+  engine: "nllb" # nllb, ollama, openai, noop
+  target_language: "zh-TW"
+  cache_size: 512 # per-text translation cache size (0 disables)
+  translator_cache_size: 4 # max cached translator instances
+  partial: false
+  nllb:
+    model: "facebook/nllb-200-distilled-600M"
+  ollama:
+    model: "gemma3:4b"
+    host: "http://localhost:11434"
+  openai:
+    model: "gpt-4o-mini"
+    api_key: ""
+    base_url: ""

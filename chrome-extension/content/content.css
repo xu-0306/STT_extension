@@ -1,0 +1,94 @@
+#stt-subtitle-overlay {
+  position: fixed;
+  bottom: 60px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2147483647;
+  pointer-events: auto;
+  font-family: "Segoe UI", "Microsoft JhengHei", "Noto Sans TC", sans-serif;
+  max-width: 95vw;
+  max-height: 80vh;
+  text-align: center;
+  opacity: 0;
+  transition: opacity 0.2s ease-in-out;
+}
+
+#stt-subtitle-overlay:not(.visible) {
+  pointer-events: none;
+}
+
+#stt-subtitle-overlay.visible {
+  opacity: 1;
+}
+
+#stt-subtitle-overlay .stt-subtitle-card {
+  background: rgba(0, 0, 0, var(--stt-card-alpha, 0.85));
+  border-radius: 8px;
+  padding: 12px 20px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  cursor: grab;
+  width: 640px;
+  height: 160px;
+  min-width: 320px;
+  min-height: 90px;
+  max-width: 95vw;
+  max-height: 80vh;
+  pointer-events: auto;
+  resize: both;
+  overflow: auto;
+  box-sizing: border-box;
+  user-select: none;
+  touch-action: none;
+}
+
+#stt-subtitle-overlay .stt-subtitle-card * {
+  user-select: none;
+}
+
+#stt-subtitle-overlay .stt-original {
+  color: #e0e0e0;
+  font-size: var(--stt-original-size, 18px);
+  line-height: 1.4;
+  margin-bottom: 6px;
+  text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.8);
+}
+
+#stt-subtitle-overlay .stt-translated {
+  color: #ffffff;
+  font-size: var(--stt-translated-size, 22px);
+  font-weight: 500;
+  line-height: 1.4;
+  text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.8);
+}
+
+#stt-subtitle-overlay .stt-status {
+  color: #888;
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+/* 動畫效果 */
+#stt-subtitle-overlay.flash .stt-subtitle-card {
+  animation: stt-flash 0.3s ease-out;
+}
+
+@keyframes stt-flash {
+  0% {
+    background: rgba(60, 60, 60, var(--stt-flash-alpha, 0.9));
+  }
+  100% {
+    background: rgba(0, 0, 0, var(--stt-card-alpha, 0.85));
+  }
+}
+
+/* 可拖曳時的樣式 */
+#stt-subtitle-overlay.draggable {
+  cursor: grabbing;
+}
+
+#stt-subtitle-overlay.draggable .stt-subtitle-card {
+  border: 1px dashed rgba(255, 255, 255, 0.3);
+  cursor: grabbing;
+}

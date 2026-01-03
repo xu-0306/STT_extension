@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>STT Subtitle Capture Settings</title>
+    <link rel="stylesheet" href="../popup/popup.css" />
+  </head>
+  <body class="options">
+    <div class="shell">
+      <header class="title-row">
+        <div class="signal-dot" aria-hidden="true"></div>
+        <div class="title-text">
+          <span class="title">Signal Bridge</span>
+          <span class="subtitle">tab audio to subtitles</span>
+        </div>
+        <span class="chip">WEBM/OPUS</span>
+      </header>
+
+      <section class="hero">
+        <h1>Stream tab audio</h1>
+        <p>Send WebM/Opus audio to WhisperLiveKit and choose a translation engine.</p>
+      </section>
+
+      <section class="panel">
+        <label for="wsUrl">WebSocket URL</label>
+        <div class="input-wrap">
+          <input
+            id="wsUrl"
+            type="text"
+            inputmode="url"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="ws://127.0.0.1:8765/asr"
+          />
+        </div>
+
+        <div class="config-grid">
+          <div class="field">
+            <label for="translationModelSelect">Translation Model</label>
+            <div class="select-wrap">
+              <select id="translationModelSelect"></select>
+            </div>
+          </div>
+          <div class="field">
+            <label for="sttModelSizeSelect">Whisper Model Size</label>
+            <div class="select-wrap">
+              <select id="sttModelSizeSelect"></select>
+            </div>
+          </div>
+        </div>
+
+        <section class="settings-card">
+          <h2>Translation Settings</h2>
+          <div class="settings-form">
+            <div class="settings-row">
+              <span class="row-label">Target language</span>
+              <span id="translationLanguageValue" class="row-value">Auto</span>
+            </div>
+            <div class="select-wrap">
+              <select id="translationLanguageSelect"></select>
+            </div>
+            <input id="newTranslationName" type="text" placeholder="Display name" />
+            <div class="select-wrap">
+              <select id="newTranslationEngine">
+                <option value="nllb" selected>NLLB (local)</option>
+                <option value="ollama">ollama</option>
+                <option value="openai">openai</option>
+                <option value="noop">none</option>
+              </select>
+            </div>
+            <input
+              id="newTranslationModel"
+              type="text"
+              placeholder="Model name (optional)"
+            />
+            <input
+              id="newTranslationHost"
+              type="text"
+              placeholder="API host (ollama)"
+            />
+            <input
+              id="newTranslationApiKey"
+              type="password"
+              placeholder="API key (openai)"
+            />
+            <input
+              id="newTranslationBaseUrl"
+              type="text"
+              placeholder="Base URL (openai, optional)"
+            />
+            <button id="addTranslationModel" class="ghost">Add translation model</button>
+          </div>
+          <div id="translationModelList" class="model-list"></div>
+        </section>
+
+        <div id="status" class="status" data-state="idle">Idle</div>
+      </section>
+
+      <footer class="footer">
+        <span>Tip:</span> keep the tab playing audio while capture is active.
+      </footer>
+    </div>
+
+    <script src="../popup/popup.js"></script>
+  </body>
+</html>

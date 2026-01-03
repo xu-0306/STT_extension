@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>STT Subtitle Capture</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="title-row">
+        <div class="signal-dot" aria-hidden="true"></div>
+        <div class="title-text">
+          <span class="title">Signal Bridge</span>
+          <span class="subtitle">tab audio to subtitles</span>
+        </div>
+        <div class="title-actions">
+          <span class="chip">WEBM/OPUS</span>
+          <button id="openSettingsBtn" class="settings-link" type="button">
+            <img src="assets/settings.png" alt="" aria-hidden="true" />
+            <span>Setting</span>
+          </button>
+        </div>
+      </header>
+
+      <section class="hero">
+        <h1>Stream tab audio</h1>
+        <p>Send WebM/Opus audio to WhisperLiveKit and choose a translation engine.</p>
+      </section>
+
+      <section class="panel">
+        <label for="wsUrl">WebSocket URL</label>
+        <div class="input-wrap">
+          <input
+            id="wsUrl"
+            type="text"
+            inputmode="url"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="ws://127.0.0.1:8765/asr"
+          />
+        </div>
+
+        <div class="config-grid">
+          <div class="field">
+            <label for="translationModelSelect">Translation Model</label>
+            <div class="select-wrap">
+              <select id="translationModelSelect"></select>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-card">
+          <h2>Subtitle Display</h2>
+          <div class="settings-form">
+            <div class="settings-row">
+              <span class="row-label">Original size</span>
+              <span id="subtitleOriginalSizeValue" class="row-value">100%</span>
+            </div>
+            <input
+              id="subtitleOriginalSize"
+              type="range"
+              min="0.7"
+              max="1.6"
+              step="0.1"
+              value="1"
+            />
+            <div class="settings-row">
+              <span class="row-label">Translation size</span>
+              <span id="subtitleTranslatedSizeValue" class="row-value">100%</span>
+            </div>
+            <input
+              id="subtitleTranslatedSize"
+              type="range"
+              min="0.7"
+              max="1.6"
+              step="0.1"
+              value="1"
+            />
+            <div class="settings-row">
+              <span class="row-label">Overlay opacity</span>
+              <span id="overlayOpacityValue" class="row-value">85%</span>
+            </div>
+            <input
+              id="overlayOpacity"
+              type="range"
+              min="0.35"
+              max="1"
+              step="0.05"
+              value="0.85"
+            />
+            <p class="hint">Tune original and translated text separately.</p>
+          </div>
+        </div>
+
+        <div class="button-row">
+          <button id="startBtn" class="primary">Start Capture</button>
+          <button id="stopBtn" class="ghost" disabled>Stop</button>
+        </div>
+
+        <div id="status" class="status" data-state="idle">Idle</div>
+      </section>
+
+      <footer class="footer">
+        <span>Tip:</span> keep the tab playing audio while capture is active.
+      </footer>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
