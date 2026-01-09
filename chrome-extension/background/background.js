@@ -1,15 +1,5 @@
 const OFFSCREEN_URL = chrome.runtime.getURL("offscreen/offscreen.html");
-let captureActive = false;
-let lastStatus = "Idle";
-let activeTabId = null; // 追蹤正在錄音的 tab ID
-
-chrome.storage.local.get(["captureActive", "lastStatus", "activeTabId"], (result) => {
-  captureActive = Boolean(result.captureActive);
-  lastStatus = result.lastStatus || "Idle";
-  if (Number.isInteger(result.activeTabId)) {
-    activeTabId = result.activeTabId;
-  }
-});
+const tabStatus = new Map();
 
 async function ensureContentScript(tabId) {
   if (!tabId) return false;
@@ -33,31 +23,18 @@ async function ensureContentScript(tabId) {
   }
 }
 
-function updateState(active, status) {
-  if (typeof active === "boolean") {
-    captureActive = active;
+async function resolveTabId(tabId) {
+  if (Number.isInteger(tabId)) {
+    return tabId;
   }
-  if (status) {
-    lastStatus = status;
+  if (typeof tabId === "string" && tabId.trim()) {
+    const parsed = Number.parseInt(tabId, 10);
+    if (Number.isInteger(parsed)) {
+      return parsed;
+    }
   }
-  chrome.storage.local.set({ captureActive, lastStatus });
-}
-
-function setActiveTabId(tabId) {
-  activeTabId = Number.isInteger(tabId) ? tabId : null;
-  chrome.storage.local.set({ activeTabId });
-}
-
-function loadStoredActiveTabId() {
-  return new Promise((resolve) => {
-    chrome.storage.local.get(["activeTabId"], (result) => {
-      if (chrome.runtime.lastError) {
-        resolve(null);
-        return;
-      }
-      resolve(Number.isInteger(result.activeTabId) ? result.activeTabId : null);
-    });
-  });
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tab?.id ?? null;
 }
 
 function sendOffscreenMessage(payload) {
@@ -82,20 +59,20 @@ async function ensureOffscreenDocument() {
   });
 }
 
-async function startCapture(wsUrl, settings) {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab || !tab.id) {
+async function startCapture(tabId, wsUrl, settings) {
+  const targetTabId = await resolveTabId(tabId);
+  if (!targetTabId) {
     throw new Error("No active tab");
   }
-  setActiveTabId(tab.id); // 儲存 tab ID 用於發送字幕
   try {
-    await ensureContentScript(activeTabId);
+    await ensureContentScript(targetTabId);
     await ensureOffscreenDocument();
-    await sendOffscreenMessage({ type: "offscreen-stop" });
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id });
+    const streamId = await chrome.tabCapture.getMediaStreamId({
+      targetTabId,
+    });
     const response = await sendOffscreenMessage({
       type: "offscreen-start",
+      tabId: targetTabId,
       streamId,
       wsUrl,
       settings,
@@ -103,27 +80,17 @@ async function startCapture(wsUrl, settings) {
     if (!response.ok) {
       throw new Error(response.error || "start failed");
     }
-    updateState(true, "Capturing");
   } catch (err) {
-    const message = err?.message || "start failed";
-    setActiveTabId(null);
-    updateState(false, message);
-    throw new Error(message);
+    throw new Error(err?.message || "start failed");
   }
 }
 
-async function stopCapture() {
+async function stopCapture(tabId) {
+  const targetTabId = await resolveTabId(tabId);
+  if (!targetTabId) return;
   await ensureOffscreenDocument();
-  await sendOffscreenMessage({ type: "offscreen-stop" });
-  let targetTabId = activeTabId;
-  if (!Number.isInteger(targetTabId)) {
-    targetTabId = await loadStoredActiveTabId();
-  }
-  if (Number.isInteger(targetTabId)) {
-    await sendSubtitleToTab(targetTabId, { type: "subtitle-remove" });
-  }
-  setActiveTabId(null);
-  updateState(false, "Stopped");
+  await sendOffscreenMessage({ type: "offscreen-stop", tabId: targetTabId });
+  await sendSubtitleToTab(targetTabId, { type: "subtitle-remove" });
 }
 
 // 發送字幕到 content script
@@ -144,46 +111,71 @@ async function sendSubtitleToTab(tabId, payload) {
   }
 }
 
+function buildFallbackStatus(requestedTabId) {
+  const status = tabStatus.get(requestedTabId) || { running: false, status: "Idle" };
+  const anyRunning = Array.from(tabStatus.values()).some((item) => item.running);
+  return {
+    ok: true,
+    capturing: Boolean(status.running),
+    status: status.status || (status.running ? "Capturing" : "Idle"),
+    globalCapturing: anyRunning,
+  };
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "popup-start") {
-    startCapture(message.wsUrl, message.settings)
+    startCapture(message.tabId, message.wsUrl, message.settings)
       .then(() => sendResponse({ ok: true }))
       .catch((err) => sendResponse({ ok: false, error: err.message }));
     return true;
   }
 
   if (message.type === "popup-stop") {
-    stopCapture()
+    stopCapture(message.tabId)
       .then(() => sendResponse({ ok: true }))
       .catch((err) => sendResponse({ ok: false, error: err.message }));
     return true;
   }
 
   if (message.type === "popup-status") {
+    const requestedTabId = Number.isInteger(message.tabId) ? message.tabId : null;
     chrome.offscreen.hasDocument().then((hasDocument) => {
       if (!hasDocument) {
-        updateState(false, "Idle");
-        sendResponse({ ok: true, capturing: false, status: lastStatus });
+        sendResponse({
+          ok: true,
+          capturing: false,
+          status: "Idle",
+          globalCapturing: false,
+        });
         return;
       }
-      sendOffscreenMessage({ type: "offscreen-status" }).then((response) => {
-        if (response && response.ok) {
-          updateState(response.running, response.status || lastStatus);
-          sendResponse({
-            ok: true,
-            capturing: response.running,
-            status: response.status || lastStatus,
-          });
-          return;
-        }
-        sendResponse({ ok: true, capturing: captureActive, status: lastStatus });
-      });
+      sendOffscreenMessage({ type: "offscreen-status", tabId: requestedTabId })
+        .then((response) => {
+          if (response && response.ok) {
+            sendResponse({
+              ok: true,
+              capturing: Boolean(response.running),
+              status: response.status || (response.running ? "Capturing" : "Idle"),
+              globalCapturing: Boolean(response.anyRunning),
+            });
+            return;
+          }
+          sendResponse(buildFallbackStatus(requestedTabId));
+        })
+        .catch(() => {
+          sendResponse(buildFallbackStatus(requestedTabId));
+        });
     });
     return true;
   }
 
   if (message.type === "offscreen-state") {
-    updateState(message.running, message.status);
+    if (Number.isInteger(message.tabId)) {
+      tabStatus.set(message.tabId, {
+        running: Boolean(message.running),
+        status: message.status || (message.running ? "Capturing" : "Idle"),
+      });
+    }
     sendResponse({ ok: true });
     return true;
   }
@@ -196,39 +188,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // 處理來自 offscreen 的字幕訊息，轉發給 content script
   if (message.type === "offscreen-subtitle") {
     const payload = message.payload;
-    console.log("[background] Received offscreen-subtitle:", payload?.type, "activeTabId:", activeTabId);
-    if (activeTabId && payload) {
+    const tabId = message.tabId;
+    if (tabId && payload) {
       if (payload.type === "subtitle") {
-        console.log("[background] Forwarding subtitle to tab", activeTabId, ":", payload.original?.slice(0, 30));
-        sendSubtitleToTab(activeTabId, {
+        sendSubtitleToTab(tabId, {
           type: "subtitle",
           original: payload.original,
           translated: payload.translated,
+          seq: payload.seq,
         });
       } else if (payload.type === "status") {
-        sendSubtitleToTab(activeTabId, {
+        sendSubtitleToTab(tabId, {
           type: "subtitle-status",
           message: payload.message,
         });
       } else if (payload.type === "error") {
-        sendSubtitleToTab(activeTabId, {
+        sendSubtitleToTab(tabId, {
           type: "subtitle-status",
           message: `Error: ${payload.message}`,
         });
       }
-    } else {
-      console.warn("[background] Cannot forward subtitle: activeTabId=", activeTabId, "payload=", !!payload);
     }
     sendResponse({ ok: true });
     return true;
   }
 
   return false;
-});
-
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (!captureActive || tabId !== activeTabId) return;
-  if (changeInfo.status === "complete") {
-    ensureContentScript(tabId);
-  }
 });

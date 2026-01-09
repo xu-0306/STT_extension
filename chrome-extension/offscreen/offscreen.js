@@ -1,18 +1,4 @@
-let mediaStream = null;
-let mediaRecorder = null;
-let ws = null;
-let running = false;
-let keepAliveTimer = null;
-let wsPingTimer = null;
-let flushTimer = null;
-let pendingChunks = [];
-let pendingBytes = 0;
-let chunkChain = Promise.resolve();
-let audioContext = null;
-let sourceNode = null;
-let monitorGain = null;
-let closing = false;
-let disconnectHandled = false;
+const sessions = new Map();
 
 const KEEP_ALIVE_INTERVAL_MS = 15000;
 const RECORDER_CHUNK_MS = 100;
@@ -20,89 +6,130 @@ const MAX_PENDING_BYTES = 8 * 1024 * 1024;
 const MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
 const PENDING_FLUSH_INTERVAL_MS = 500;
 
-function notifyBackground(status, runningOverride) {
+function normalizeTabId(value) {
+  if (Number.isInteger(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isInteger(parsed)) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function createSession(tabId, wsUrl, settings) {
+  return {
+    tabId,
+    wsUrl,
+    settings,
+    mediaStream: null,
+    mediaRecorder: null,
+    ws: null,
+    running: false,
+    keepAliveTimer: null,
+    wsPingTimer: null,
+    flushTimer: null,
+    pendingChunks: [],
+    pendingBytes: 0,
+    chunkChain: Promise.resolve(),
+    audioContext: null,
+    sourceNode: null,
+    monitorGain: null,
+    closing: false,
+    disconnectHandled: false,
+  };
+}
+
+function isSessionActive(session) {
+  return sessions.get(session.tabId) === session;
+}
+
+function notifyBackground(tabId, status, runningOverride) {
   chrome.runtime.sendMessage({
     type: "offscreen-state",
+    tabId,
     status,
-    running: typeof runningOverride === "boolean" ? runningOverride : running,
+    running: typeof runningOverride === "boolean" ? runningOverride : false,
   });
 }
 
-function startKeepAlive() {
-  stopKeepAlive();
-  keepAliveTimer = setInterval(() => {
+function startKeepAlive(session) {
+  stopKeepAlive(session);
+  session.keepAliveTimer = setInterval(() => {
     chrome.runtime.sendMessage({ type: "offscreen-keepalive" });
   }, KEEP_ALIVE_INTERVAL_MS);
-  wsPingTimer = setInterval(() => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "ping", ts: Date.now() }));
+  session.wsPingTimer = setInterval(() => {
+    if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+      session.ws.send(JSON.stringify({ type: "ping", ts: Date.now() }));
     }
   }, KEEP_ALIVE_INTERVAL_MS);
-  flushTimer = setInterval(() => {
-    flushPendingChunks();
+  session.flushTimer = setInterval(() => {
+    flushPendingChunks(session);
   }, PENDING_FLUSH_INTERVAL_MS);
 }
 
-function stopKeepAlive() {
-  if (keepAliveTimer) {
-    clearInterval(keepAliveTimer);
-    keepAliveTimer = null;
+function stopKeepAlive(session) {
+  if (session.keepAliveTimer) {
+    clearInterval(session.keepAliveTimer);
+    session.keepAliveTimer = null;
   }
-  if (wsPingTimer) {
-    clearInterval(wsPingTimer);
-    wsPingTimer = null;
+  if (session.wsPingTimer) {
+    clearInterval(session.wsPingTimer);
+    session.wsPingTimer = null;
   }
-  if (flushTimer) {
-    clearInterval(flushTimer);
-    flushTimer = null;
+  if (session.flushTimer) {
+    clearInterval(session.flushTimer);
+    session.flushTimer = null;
   }
 }
 
-function canSendNow() {
+function canSendNow(session) {
   return (
-    ws &&
-    ws.readyState === WebSocket.OPEN &&
-    ws.bufferedAmount < MAX_BUFFERED_BYTES
+    session.ws &&
+    session.ws.readyState === WebSocket.OPEN &&
+    session.ws.bufferedAmount < MAX_BUFFERED_BYTES
   );
 }
 
-function enqueueChunk(buffer) {
+function enqueueChunk(session, buffer) {
   if (!buffer || buffer.byteLength === 0) {
     return;
   }
-  if (pendingChunks.length === 0 && canSendNow()) {
-    ws.send(buffer);
+  if (session.pendingChunks.length === 0 && canSendNow(session)) {
+    session.ws.send(buffer);
     return;
   }
-  pendingChunks.push(buffer);
-  pendingBytes += buffer.byteLength;
-  while (pendingBytes > MAX_PENDING_BYTES && pendingChunks.length > 0) {
-    const dropped = pendingChunks.shift();
+  session.pendingChunks.push(buffer);
+  session.pendingBytes += buffer.byteLength;
+  while (session.pendingBytes > MAX_PENDING_BYTES && session.pendingChunks.length > 0) {
+    const dropped = session.pendingChunks.shift();
     if (dropped) {
-      pendingBytes -= dropped.byteLength;
+      session.pendingBytes -= dropped.byteLength;
     }
   }
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    flushPendingChunks();
+  if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+    flushPendingChunks(session);
   }
 }
 
-function flushPendingChunks() {
-  if (!ws || ws.readyState !== WebSocket.OPEN || pendingChunks.length === 0) {
+function flushPendingChunks(session) {
+  if (!session.ws || session.ws.readyState !== WebSocket.OPEN || session.pendingChunks.length === 0) {
     return;
   }
-  while (pendingChunks.length > 0 && ws.bufferedAmount < MAX_BUFFERED_BYTES) {
-    const chunk = pendingChunks.shift();
+  while (session.pendingChunks.length > 0 && session.ws.bufferedAmount < MAX_BUFFERED_BYTES) {
+    const chunk = session.pendingChunks.shift();
     if (!chunk) {
       continue;
     }
-    pendingBytes -= chunk.byteLength;
-    ws.send(chunk);
+    session.pendingBytes -= chunk.byteLength;
+    session.ws.send(chunk);
   }
-  if (pendingChunks.length === 0) {
-    pendingBytes = 0;
-  } else if (pendingBytes < 0) {
-    pendingBytes = 0;
+  if (session.pendingChunks.length === 0) {
+    session.pendingBytes = 0;
+  } else if (session.pendingBytes < 0) {
+    session.pendingBytes = 0;
   }
 }
 
@@ -117,111 +144,137 @@ function pickMimeType() {
   return "";
 }
 
-async function startCapture(streamId, wsUrl, settings) {
-  if (running) {
-    await stopCapture();
+async function startCapture(tabId, streamId, wsUrl, settings) {
+  const normalizedTabId = normalizeTabId(tabId);
+  if (!normalizedTabId) {
+    throw new Error("Invalid tab id");
   }
-  running = true;
-  closing = false;
-  disconnectHandled = false;
-  notifyBackground("Starting...", true);
-  startKeepAlive();
-  pendingChunks = [];
-  pendingBytes = 0;
-  chunkChain = Promise.resolve();
+  if (sessions.has(normalizedTabId)) {
+    await stopCapture(normalizedTabId);
+  }
 
-  ws = new WebSocket(wsUrl);
-  ws.binaryType = "arraybuffer";
-  ws.addEventListener("open", () => {
-    notifyBackground("Connected", true);
-    if (settings && (settings.translation || settings.stt)) {
-      const payload = { type: "config" };
-      if (settings.translation) {
-        payload.translation = settings.translation;
-      }
-      if (settings.stt) {
-        payload.stt = settings.stt;
-      }
-      ws.send(JSON.stringify(payload));
-    }
-    flushPendingChunks();
-  });
-  ws.addEventListener("message", (event) => {
-    if (typeof event.data !== "string") {
-      return;
-    }
-    try {
-      const payload = JSON.parse(event.data);
-      if (payload.type === "subtitle" || payload.type === "status" || payload.type === "error") {
-        chrome.runtime.sendMessage(
-          { type: "offscreen-subtitle", payload },
-          () => {}
-        );
-      }
-    } catch (err) {
-      console.error("[offscreen] JSON parse error:", err.message);
-    }
-  });
-  ws.addEventListener("close", (event) => {
-    handleWsDisconnect(`Disconnected (${event.code || 0})`);
-  });
-  ws.addEventListener("error", () => {
-    handleWsDisconnect("WebSocket error");
-  });
+  const session = createSession(normalizedTabId, wsUrl, settings);
+  sessions.set(normalizedTabId, session);
 
-  mediaStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      mandatory: {
-        chromeMediaSource: "tab",
-        chromeMediaSourceId: streamId,
-      },
-    },
-  });
+  session.running = true;
+  session.closing = false;
+  session.disconnectHandled = false;
+  notifyBackground(tabId, "Starting...", true);
+  startKeepAlive(session);
+  session.pendingChunks = [];
+  session.pendingBytes = 0;
+  session.chunkChain = Promise.resolve();
 
   try {
-    // Route captured audio to output so the tab doesn't go silent during capture.
-    audioContext = new AudioContext();
-    await audioContext.resume();
-    audioContext.addEventListener("statechange", () => {
-      if (running && audioContext && audioContext.state === "suspended") {
-        audioContext.resume();
+    session.ws = new WebSocket(wsUrl);
+    session.ws.binaryType = "arraybuffer";
+    session.ws.addEventListener("open", () => {
+      if (!isSessionActive(session)) return;
+      notifyBackground(tabId, "Connected", true);
+      if (settings && (settings.translation || settings.stt)) {
+        const payload = { type: "config" };
+        if (settings.translation) {
+          payload.translation = settings.translation;
+        }
+        if (settings.stt) {
+          payload.stt = settings.stt;
+        }
+        session.ws.send(JSON.stringify(payload));
+      }
+      flushPendingChunks(session);
+    });
+    session.ws.addEventListener("message", (event) => {
+      if (!isSessionActive(session)) return;
+      if (typeof event.data !== "string") {
+        return;
+      }
+      try {
+        const payload = JSON.parse(event.data);
+        if (payload.type === "subtitle" || payload.type === "status" || payload.type === "error") {
+          chrome.runtime.sendMessage(
+            { type: "offscreen-subtitle", tabId: session.tabId, payload },
+            () => {}
+          );
+        }
+      } catch (err) {
+        console.error("[offscreen] JSON parse error:", err.message);
       }
     });
-    sourceNode = audioContext.createMediaStreamSource(mediaStream);
-    monitorGain = audioContext.createGain();
-    monitorGain.gain.value = 1;
-    sourceNode.connect(monitorGain);
-    monitorGain.connect(audioContext.destination);
-  } catch (err) {
-    console.warn("[offscreen] audio monitor init error:", err?.message || err);
-  }
+    session.ws.addEventListener("close", (event) => {
+      if (!isSessionActive(session)) return;
+      handleWsDisconnect(session, `Disconnected (${event.code || 0})`);
+    });
+    session.ws.addEventListener("error", () => {
+      if (!isSessionActive(session)) return;
+      handleWsDisconnect(session, "WebSocket error");
+    });
 
-  const mimeType = pickMimeType();
-  const options = mimeType ? { mimeType } : undefined;
-  mediaRecorder = new MediaRecorder(mediaStream, options);
-  mediaRecorder.addEventListener("dataavailable", (event) => {
-    const blob = event.data;
-    if (!blob || blob.size === 0) {
-      return;
-    }
-    chunkChain = chunkChain
-      .then(async () => {
-        const buffer = await blob.arrayBuffer();
-        enqueueChunk(buffer);
-      })
-      .catch((err) => {
-        console.warn("[offscreen] chunk encode error:", err?.message || err);
+    session.mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        mandatory: {
+          chromeMediaSource: "tab",
+          chromeMediaSourceId: streamId,
+        },
+      },
+    });
+
+    try {
+      // Route captured audio to output so the tab doesn't go silent during capture.
+      session.audioContext = new AudioContext();
+      await session.audioContext.resume();
+      session.audioContext.addEventListener("statechange", () => {
+        if (session.running && session.audioContext && session.audioContext.state === "suspended") {
+          session.audioContext.resume();
+        }
       });
-  });
-  mediaRecorder.start(RECORDER_CHUNK_MS);
+      session.sourceNode = session.audioContext.createMediaStreamSource(session.mediaStream);
+      session.monitorGain = session.audioContext.createGain();
+      session.monitorGain.gain.value = 1;
+      session.sourceNode.connect(session.monitorGain);
+      session.monitorGain.connect(session.audioContext.destination);
+    } catch (err) {
+      console.warn("[offscreen] audio monitor init error:", err?.message || err);
+    }
+
+    const mimeType = pickMimeType();
+    const options = mimeType ? { mimeType } : undefined;
+    session.mediaRecorder = new MediaRecorder(session.mediaStream, options);
+    session.mediaRecorder.addEventListener("dataavailable", (event) => {
+      if (!isSessionActive(session)) return;
+      const blob = event.data;
+      if (!blob || blob.size === 0) {
+        return;
+      }
+      session.chunkChain = session.chunkChain
+        .then(async () => {
+          const buffer = await blob.arrayBuffer();
+          enqueueChunk(session, buffer);
+        })
+        .catch((err) => {
+          console.warn("[offscreen] chunk encode error:", err?.message || err);
+        });
+    });
+    session.mediaRecorder.start(RECORDER_CHUNK_MS);
+  } catch (err) {
+    session.running = false;
+    session.closing = true;
+    session.disconnectHandled = true;
+    notifyBackground(tabId, err?.message || "Capture start failed", false);
+    await cleanupCaptureResources(session, { closeWebSocket: true });
+    session.closing = false;
+    if (isSessionActive(session)) {
+      sessions.delete(normalizedTabId);
+    }
+    throw err;
+  }
 }
 
-async function cleanupCaptureResources(options = {}) {
+async function cleanupCaptureResources(session, options = {}) {
   const closeWebSocket = options.closeWebSocket !== false;
 
-  if (mediaRecorder) {
+  if (session.mediaRecorder) {
     try {
-      const recorder = mediaRecorder;
+      const recorder = session.mediaRecorder;
       const stopped = new Promise((resolve) => {
         recorder.addEventListener("stop", resolve, { once: true });
       });
@@ -236,97 +289,127 @@ async function cleanupCaptureResources(options = {}) {
         new Promise((resolve) => setTimeout(resolve, 1000)),
       ]);
       await Promise.race([
-        chunkChain,
+        session.chunkChain,
         new Promise((resolve) => setTimeout(resolve, 1000)),
       ]);
     } catch (err) {
       console.warn("[offscreen] MediaRecorder stop error:", err.message);
     }
-    mediaRecorder = null;
+    session.mediaRecorder = null;
   }
 
-  if (mediaStream) {
-    mediaStream.getTracks().forEach((track) => track.stop());
-    mediaStream = null;
+  if (session.mediaStream) {
+    session.mediaStream.getTracks().forEach((track) => track.stop());
+    session.mediaStream = null;
   }
 
-  if (monitorGain) {
-    monitorGain.disconnect();
-    monitorGain = null;
+  if (session.monitorGain) {
+    session.monitorGain.disconnect();
+    session.monitorGain = null;
   }
 
-  if (sourceNode) {
-    sourceNode.disconnect();
-    sourceNode = null;
+  if (session.sourceNode) {
+    session.sourceNode.disconnect();
+    session.sourceNode = null;
   }
 
-  if (audioContext) {
+  if (session.audioContext) {
     try {
-      await audioContext.close();
+      await session.audioContext.close();
     } catch (err) {
       console.warn("[offscreen] AudioContext close error:", err?.message || err);
     }
-    audioContext = null;
+    session.audioContext = null;
   }
 
-  if (closeWebSocket && ws) {
-    ws.close();
-    ws = null;
+  if (closeWebSocket && session.ws) {
+    session.ws.close();
+    session.ws = null;
   }
   if (!closeWebSocket) {
-    ws = null;
+    session.ws = null;
   }
-  stopKeepAlive();
+  stopKeepAlive(session);
 }
 
-function handleWsDisconnect(message) {
-  if (closing || disconnectHandled) return;
-  disconnectHandled = true;
-  running = false;
-  notifyBackground(message, false);
-  if (ws && ws.readyState === WebSocket.OPEN) {
+function handleWsDisconnect(session, message) {
+  if (session.closing || session.disconnectHandled) return;
+  session.disconnectHandled = true;
+  session.running = false;
+  notifyBackground(session.tabId, message, false);
+  if (session.ws && session.ws.readyState === WebSocket.OPEN) {
     try {
-      ws.close();
+      session.ws.close();
     } catch (err) {
       // Ignore close errors.
     }
   }
-  ws = null;
-  cleanupCaptureResources({ closeWebSocket: false }).catch((err) => {
-    console.warn("[offscreen] cleanup error:", err?.message || err);
-  });
+  session.ws = null;
+  cleanupCaptureResources(session, { closeWebSocket: false })
+    .catch((err) => {
+      console.warn("[offscreen] cleanup error:", err?.message || err);
+    })
+    .finally(() => {
+      if (isSessionActive(session)) {
+        sessions.delete(session.tabId);
+      }
+    });
 }
 
-async function stopCapture() {
-  running = false;
-  closing = true;
-  disconnectHandled = true;
-  notifyBackground("Stopping...", false);
-  await cleanupCaptureResources({ closeWebSocket: true });
-  closing = false;
-  notifyBackground("Stopped", false);
+async function stopCapture(tabId) {
+  const normalizedTabId = normalizeTabId(tabId);
+  if (!normalizedTabId) {
+    throw new Error("Invalid tab id");
+  }
+  const session = sessions.get(normalizedTabId);
+  if (!session) return;
+  session.running = false;
+  session.closing = true;
+  session.disconnectHandled = true;
+  notifyBackground(tabId, "Stopping...", false);
+  await cleanupCaptureResources(session, { closeWebSocket: true });
+  session.closing = false;
+  if (isSessionActive(session)) {
+    sessions.delete(normalizedTabId);
+  }
+  notifyBackground(tabId, "Stopped", false);
+}
+
+async function stopAllCaptures() {
+  const tabIds = Array.from(sessions.keys());
+  for (const tabId of tabIds) {
+    await stopCapture(tabId);
+  }
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "offscreen-start") {
-    startCapture(message.streamId, message.wsUrl, message.settings)
+    const tabId = message.tabId;
+    startCapture(tabId, message.streamId, message.wsUrl, message.settings)
       .then(() => sendResponse({ ok: true }))
       .catch((err) => sendResponse({ ok: false, error: err.message }));
     return true;
   }
 
   if (message.type === "offscreen-status") {
+    const requestedTabId = normalizeTabId(message.tabId);
+    const session = requestedTabId !== null ? sessions.get(requestedTabId) : null;
+    const running = Boolean(session?.running);
+    const anyRunning = Array.from(sessions.values()).some((item) => item.running);
     sendResponse({
       ok: true,
       running,
       status: running ? "Capturing" : "Idle",
-      wsReadyState: ws ? ws.readyState : null,
+      wsReadyState: session?.ws ? session.ws.readyState : null,
+      anyRunning,
     });
     return true;
   }
 
   if (message.type === "offscreen-stop") {
-    stopCapture()
+    const tabId = message.tabId;
+    const stopPromise = Number.isInteger(tabId) ? stopCapture(tabId) : stopAllCaptures();
+    stopPromise
       .then(() => sendResponse({ ok: true }))
       .catch((err) => sendResponse({ ok: false, error: err.message }));
     return true;

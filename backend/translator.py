@@ -3,7 +3,10 @@ from __future__ import annotations
 from typing import Dict, Optional, Tuple
 import threading
 
-from cache import LRUCache
+try:
+    from .cache import LRUCache
+except ImportError:  # Fallback when running as a script.
+    from cache import LRUCache
 
 DEFAULT_CACHE_SIZE = 512
 

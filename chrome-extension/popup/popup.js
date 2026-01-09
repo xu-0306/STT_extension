@@ -12,6 +12,7 @@ const DEFAULT_OVERLAY_OPACITY = 0.85;
 const MIN_OVERLAY_OPACITY = 0.35;
 const MAX_OVERLAY_OPACITY = 1;
 const DEFAULT_STT_MODEL_SIZE = "medium";
+const DEFAULT_TARGET_LANGUAGE = "zh-TW";
 
 const DEFAULT_TRANSLATION_MODELS = [
   {
@@ -73,7 +74,7 @@ const translationLanguageValue = document.getElementById("translationLanguageVal
 const state = {
   translationModels: [],
   selectedTranslationModel: "",
-  translationTargetLanguage: "auto",
+  translationTargetLanguage: DEFAULT_TARGET_LANGUAGE,
   sttModelSize: DEFAULT_STT_MODEL_SIZE,
 };
 
@@ -113,6 +114,21 @@ function storageGet(keys) {
 
 function storageSet(values) {
   return new Promise((resolve) => chrome.storage.local.set(values, resolve));
+}
+
+function getActiveTabId() {
+  if (!chrome?.tabs?.query) {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (chrome.runtime.lastError) {
+        resolve(null);
+        return;
+      }
+      resolve(tabs && tabs[0] ? tabs[0].id : null);
+    });
+  });
 }
 
 function setSelectedTranslationId(id) {
@@ -314,7 +330,7 @@ async function loadState() {
   wsInput.value = normalized.wsUrl || DEFAULT_WS_URL;
   state.translationModels = normalized.translationModels || DEFAULT_TRANSLATION_MODELS.slice();
   state.selectedTranslationModel = normalized.selectedTranslationModel || "";
-  state.translationTargetLanguage = data[TARGET_LANGUAGE_KEY] || "auto";
+  state.translationTargetLanguage = data[TARGET_LANGUAGE_KEY] || DEFAULT_TARGET_LANGUAGE;
   state.sttModelSize = data[STT_MODEL_SIZE_KEY] || DEFAULT_STT_MODEL_SIZE;
 
   renderTranslationSelect();
@@ -355,6 +371,9 @@ async function loadState() {
   if (data[STT_MODEL_SIZE_KEY] === undefined) {
     storageSet({ [STT_MODEL_SIZE_KEY]: state.sttModelSize });
   }
+  if (data[TARGET_LANGUAGE_KEY] === undefined) {
+    storageSet({ [TARGET_LANGUAGE_KEY]: state.translationTargetLanguage });
+  }
   renderModelList(
     translationModelList,
     state.translationModels,
@@ -367,8 +386,9 @@ async function loadState() {
   );
 }
 
-function refreshCaptureStatus() {
-  chrome.runtime.sendMessage({ type: "popup-status" }, (response) => {
+async function refreshCaptureStatus() {
+  const tabId = await getActiveTabId();
+  chrome.runtime.sendMessage({ type: "popup-status", tabId }, (response) => {
     if (chrome.runtime.lastError) {
       return;
     }
@@ -376,8 +396,13 @@ function refreshCaptureStatus() {
       return;
     }
     const capturing = Boolean(response.capturing);
+    const globalCapturing = Boolean(response.globalCapturing);
+    let statusText = response.status || (capturing ? "Capturing" : "Idle");
+    if (!capturing && globalCapturing) {
+      statusText = "Capturing in another tab";
+    }
     setButtons(capturing);
-    setStatus(response.status || (capturing ? "Capturing" : "Idle"), capturing ? "active" : "idle");
+    setStatus(statusText, capturing ? "active" : "idle");
   });
 }
 
@@ -621,7 +646,12 @@ if (openSettingsBtn) {
 }
 
 if (startBtn) {
-  startBtn.addEventListener("click", () => {
+  startBtn.addEventListener("click", async () => {
+    const tabId = await getActiveTabId();
+    if (!tabId) {
+      setStatus("Error: no active tab", "error");
+      return;
+    }
     const wsUrl = wsInput.value.trim() || DEFAULT_WS_URL;
     const translationModel =
       state.translationModels.find((model) => model.id === state.selectedTranslationModel) ||
@@ -654,27 +684,31 @@ if (startBtn) {
 
     storageSet({ wsUrl });
 
-    chrome.runtime.sendMessage({ type: "popup-start", wsUrl, settings }, (response) => {
-      if (chrome.runtime.lastError) {
-        setStatus("Error: extension unavailable", "error");
-        setButtons(false);
-        return;
+    chrome.runtime.sendMessage(
+      { type: "popup-start", tabId, wsUrl, settings },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          setStatus("Error: extension unavailable", "error");
+          setButtons(false);
+          return;
+        }
+        if (!response || !response.ok) {
+          setStatus(`Error: ${response?.error || "failed"}`, "error");
+          setButtons(false);
+          return;
+        }
+        setStatus("Capturing", "active");
       }
-      if (!response || !response.ok) {
-        setStatus(`Error: ${response?.error || "failed"}`, "error");
-        setButtons(false);
-        return;
-      }
-      setStatus("Capturing", "active");
-    });
+    );
   });
 }
 
 if (stopBtn) {
-  stopBtn.addEventListener("click", () => {
+  stopBtn.addEventListener("click", async () => {
+    const tabId = await getActiveTabId();
     setStatus("Stopping...", "active");
 
-    chrome.runtime.sendMessage({ type: "popup-stop" }, (response) => {
+    chrome.runtime.sendMessage({ type: "popup-stop", tabId }, (response) => {
       if (chrome.runtime.lastError) {
         setStatus("Error: extension unavailable", "error");
         return;

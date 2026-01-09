@@ -9,6 +9,10 @@
   const SILENCE_CLEAR_MS = 2500; // Gap between updates to start a new utterance.
   const MAX_ORIGINAL_CHARS = 260;
   const MAX_TRANSLATED_CHARS = 260;
+  const MAX_SENTENCES_DEFAULT = 2;
+  const MAX_SENTENCES_CJK = 1;
+  const SENTENCE_ENDINGS = new Set([".", "!", "?", "。", "！", "？", "…"]);
+  const CJK_REGEX = /[\\u4e00-\\u9fff\\u3040-\\u30ff\\u31f0-\\u31ff]/;
   const POSITION_STORAGE_KEY = "sttSubtitleOverlayPosition";
   const SIZE_STORAGE_KEY = "sttSubtitleOverlaySize";
   const DEFAULT_OVERLAY_WIDTH = 640;
@@ -52,12 +56,79 @@
   let fontScaleLoaded = false;
   let overlayOpacity = DEFAULT_OVERLAY_OPACITY;
   let overlayOpacityLoaded = false;
+  let lastSeq = 0;
+  let lastTranslatedSeq = 0;
 
   function trimText(text, maxChars) {
     if (!text) return "";
     if (!maxChars || text.length <= maxChars) return text;
     const trimmed = text.slice(-maxChars);
     return trimmed.replace(/^[\s\.,;:!\?-]+/, "");
+  }
+
+  function normalizeText(text) {
+    if (!text) return "";
+    return text.replace(/\s+/g, " ").trim();
+  }
+
+  function shouldApplySeq(seq) {
+    const numeric = Number(seq);
+    if (!Number.isFinite(numeric)) {
+      return true;
+    }
+    if (numeric < lastSeq) {
+      return false;
+    }
+    if (numeric > lastSeq) {
+      lastSeq = numeric;
+    }
+    return true;
+  }
+
+  function shouldApplyTranslationSeq(seq) {
+    const numeric = Number(seq);
+    if (!Number.isFinite(numeric)) {
+      return true;
+    }
+    if (numeric < lastTranslatedSeq) {
+      return false;
+    }
+    lastTranslatedSeq = numeric;
+    return true;
+  }
+
+  function splitSentences(text) {
+    const segments = [];
+    let start = 0;
+    for (let i = 0; i < text.length; i += 1) {
+      if (SENTENCE_ENDINGS.has(text[i])) {
+        const part = text.slice(start, i + 1).trim();
+        if (part) {
+          segments.push(part);
+        }
+        start = i + 1;
+      }
+    }
+    const tail = text.slice(start).trim();
+    if (tail) {
+      segments.push(tail);
+    }
+    return segments;
+  }
+
+  function compactText(text, maxChars) {
+    const normalized = normalizeText(text);
+    if (!normalized) return "";
+    if (!maxChars || normalized.length <= maxChars) return normalized;
+    const sentenceLimit = CJK_REGEX.test(normalized)
+      ? MAX_SENTENCES_CJK
+      : MAX_SENTENCES_DEFAULT;
+    const segments = splitSentences(normalized);
+    if (segments.length > sentenceLimit) {
+      const tail = segments.slice(-sentenceLimit).join(" ");
+      return trimText(tail, maxChars);
+    }
+    return trimText(normalized, maxChars);
   }
 
   function clearSubtitleText() {
@@ -579,8 +650,11 @@
     overlayEl.classList.add("flash");
   }
 
-  function updateSubtitle(original, translated) {
+  function updateSubtitle(original, translated, seq) {
     console.log("[content] updateSubtitle called - overlayEl exists:", !!overlayEl);
+    if (!shouldApplySeq(seq)) {
+      return;
+    }
     if (!overlayEl) createOverlay();
     ensureOverlayHost();
 
@@ -598,8 +672,8 @@
       clearSubtitleText();
     }
 
-    const displayOriginal = trimText(originalText, MAX_ORIGINAL_CHARS);
-    const displayTranslated = trimText(translatedText, MAX_TRANSLATED_CHARS);
+    const displayOriginal = compactText(originalText, MAX_ORIGINAL_CHARS);
+    const displayTranslated = compactText(translatedText, MAX_TRANSLATED_CHARS);
 
     if (!displayOriginal && !displayTranslated) {
       return;
@@ -615,14 +689,33 @@
     if (displayTranslated) {
       translatedEl.textContent = displayTranslated;
       translatedEl.style.display = "block";
-    } else {
+      shouldApplyTranslationSeq(seq);
+    } else if (!translatedEl.textContent.trim()) {
       translatedEl.style.display = "none";
     }
 
     statusEl.style.display = "none";
     showOverlay();
-    flashOverlay();
     console.log("[content] updateSubtitle done - overlay visible:", overlayEl?.classList.contains("visible"));
+  }
+
+  function updateTranslatedOnly(translated, seq) {
+    if (!translated) return;
+    if (!shouldApplyTranslationSeq(seq)) {
+      return;
+    }
+    if (!overlayEl) createOverlay();
+    ensureOverlayHost();
+
+    const displayTranslated = compactText(translated, MAX_TRANSLATED_CHARS);
+    if (!displayTranslated) {
+      return;
+    }
+
+    translatedEl.textContent = displayTranslated;
+    translatedEl.style.display = "block";
+    statusEl.style.display = "none";
+    showOverlay();
   }
 
   function updateStatus(message) {
@@ -653,6 +746,8 @@
       translatedEl = null;
       statusEl = null;
     }
+    lastSeq = 0;
+    lastTranslatedSeq = 0;
     if (hideTimer) {
       clearTimeout(hideTimer);
       hideTimer = null;
@@ -673,7 +768,14 @@
 
     if (message.type === "subtitle") {
       console.log("[content] Updating subtitle - original:", message.original?.slice(0, 50), "translated:", message.translated?.slice(0, 50));
-      updateSubtitle(message.original, message.translated);
+      const seqValue = message.seq;
+      const seqNumeric = Number(seqValue);
+      if (Number.isFinite(seqNumeric) && seqNumeric < lastSeq && message.translated) {
+        updateTranslatedOnly(message.translated, seqValue);
+        sendResponse({ ok: true });
+        return true;
+      }
+      updateSubtitle(message.original, message.translated, message.seq);
       sendResponse({ ok: true });
       return true;
     }
@@ -720,8 +822,7 @@
     });
   }
 
-  // 初始化時創建 overlay（但不顯示）
-  createOverlay();
+  // Overlay is created on-demand when the first subtitle/status arrives.
 
   console.log("[STT Subtitle] Content script loaded");
 })();
