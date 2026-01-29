@@ -13,25 +13,7 @@ if __package__ in (None, ""):
 from gui import config_manager
 from gui.backend_runner import BackendRunner
 from gui.download_worker import ModelDownloadWorker
-from gui.model_catalog import WHISPER_MODEL_URLS, model_filename
-
-LANGUAGE_OPTIONS = [
-    ("auto", "Auto"),
-    ("en", "English"),
-    ("ja", "Japanese"),
-    ("zh-TW", "Chinese (Traditional)"),
-    ("zh-CN", "Chinese (Simplified)"),
-    ("ko", "Korean"),
-    ("fr", "French"),
-    ("de", "German"),
-    ("es", "Spanish"),
-    ("pt", "Portuguese"),
-    ("it", "Italian"),
-    ("ru", "Russian"),
-    ("id", "Indonesian"),
-    ("vi", "Vietnamese"),
-    ("th", "Thai"),
-]
+from backend.model_manager import WHISPER_MODEL_URLS, model_filename
 
 MODEL_OPTIONS = [
     ("tiny", "Tiny"),
@@ -40,52 +22,13 @@ MODEL_OPTIONS = [
     ("medium", "Medium"),
     ("large-v3", "Large v3"),
 ]
-
-ENGINE_OPTIONS = [
-    ("nllb", "NLLB (local)"),
-    ("ollama", "Ollama"),
-    ("openai", "OpenAI"),
-    ("noop", "None"),
-]
-
 SUBTITLE_MAX_CHARS_DEFAULT = 260
 SUBTITLE_MAX_SENTENCES_DEFAULT = 2
 SUBTITLE_MAX_SENTENCES_CJK = 1
 SUBTITLE_HISTORY_LINES_DEFAULT = 2
 SUBTITLE_SHOW_PARTIAL_DEFAULT = True
-MAX_CONTEXT_TOKENS_DEFAULT = 64
 STALL_TIMEOUT_DEFAULT = 15
 STALL_CHECK_INTERVAL_DEFAULT = 5
-TRANSLATION_DEBOUNCE_MS_DEFAULT = 300
-OLLAMA_KEEP_ALIVE_DEFAULT = "5m"
-
-
-def _coerce_keep_alive_value(value: object) -> Optional[object]:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return OLLAMA_KEEP_ALIVE_DEFAULT if value else 0
-    if isinstance(value, (int, float)):
-        return int(value)
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return None
-        if stripped.isdigit():
-            return int(stripped)
-        return stripped
-    return None
-
-
-def _keep_alive_enabled(value: object) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, bool):
-        return value
-    try:
-        return float(value) > 0
-    except (TypeError, ValueError):
-        return bool(str(value).strip())
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -105,7 +48,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.force_close = False
         self.backend_failed = False
         self.last_backend_error: Optional[str] = None
-        self._ollama_keep_alive_value: Optional[object] = None
 
         self._build_ui()
         self._apply_styles()
@@ -125,7 +67,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.addTab(self._build_server_tab(), "Server")
         self.tabs.addTab(self._build_stt_tab(), "STT")
-        self.tabs.addTab(self._build_translation_tab(), "Translation")
+        self.tabs.addTab(self._build_tuning_tab(), "Tuning")
         layout.addWidget(self.tabs)
 
         footer = QtWidgets.QHBoxLayout()
@@ -206,7 +148,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(tab)
         layout.setSpacing(12)
 
-        model_group = QtWidgets.QGroupBox("Model")
+        model_group = QtWidgets.QGroupBox("Model downloads")
         form = QtWidgets.QFormLayout(model_group)
 
         self.model_select_combo = QtWidgets.QComboBox()
@@ -233,7 +175,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.download_progress.hide()
         self.download_label = QtWidgets.QLabel("")
 
-        form.addRow("Model", model_select_row)
+        form.addRow("Model to download", model_select_row)
         form.addRow("Model directory", model_cache_row)
         form.addRow("Download", self.download_progress)
         form.addRow("", self.download_label)
@@ -248,41 +190,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return tab
 
-    def _build_translation_tab(self) -> QtWidgets.QWidget:
+    def _build_tuning_tab(self) -> QtWidgets.QWidget:
         tab = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(tab)
         layout.setSpacing(12)
-
-        engine_group = QtWidgets.QGroupBox("Translation")
-        form = QtWidgets.QFormLayout(engine_group)
-
-        self.translation_engine_combo = QtWidgets.QComboBox()
-        for key, label in ENGINE_OPTIONS:
-            self.translation_engine_combo.addItem(label, key)
-
-        self.translation_language_combo = QtWidgets.QComboBox()
-        for key, label in LANGUAGE_OPTIONS:
-            self.translation_language_combo.addItem(label, key)
-
-        self.translation_partial_check = QtWidgets.QCheckBox("Translate partials")
-        self.translation_debounce_input = QtWidgets.QSpinBox()
-        self.translation_debounce_input.setRange(0, 5000)
-        self.translation_debounce_input.setValue(TRANSLATION_DEBOUNCE_MS_DEFAULT)
-        self.translation_debounce_input.setSuffix(" ms")
-
-        form.addRow("Engine", self.translation_engine_combo)
-        form.addRow("Target language", self.translation_language_combo)
-        form.addRow("", self.translation_partial_check)
-        form.addRow("Debounce", self.translation_debounce_input)
-
-        self.engine_stack = QtWidgets.QStackedWidget()
-        self.engine_stack.addWidget(self._build_engine_nllb())
-        self.engine_stack.addWidget(self._build_engine_ollama())
-        self.engine_stack.addWidget(self._build_engine_openai())
-        self.engine_stack.addWidget(self._build_engine_noop())
-        form.addRow(self.engine_stack)
-
-        layout.addWidget(engine_group)
 
         cleanup_group = QtWidgets.QGroupBox("Subtitle cleanup")
         cleanup_form = QtWidgets.QFormLayout(cleanup_group)
@@ -312,16 +223,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         stability_group = QtWidgets.QGroupBox("STT stability")
         stability_form = QtWidgets.QFormLayout(stability_group)
-        self.max_context_tokens_input = QtWidgets.QSpinBox()
-        self.max_context_tokens_input.setRange(0, 2048)
-        self.max_context_tokens_input.setValue(MAX_CONTEXT_TOKENS_DEFAULT)
         self.stall_timeout_input = QtWidgets.QSpinBox()
         self.stall_timeout_input.setRange(0, 300)
         self.stall_timeout_input.setValue(STALL_TIMEOUT_DEFAULT)
         self.stall_check_interval_input = QtWidgets.QSpinBox()
         self.stall_check_interval_input.setRange(0, 300)
         self.stall_check_interval_input.setValue(STALL_CHECK_INTERVAL_DEFAULT)
-        stability_form.addRow("Max context tokens", self.max_context_tokens_input)
         stability_form.addRow("Stall timeout (sec)", self.stall_timeout_input)
         stability_form.addRow(
             "Stall check interval (sec)", self.stall_check_interval_input
@@ -329,47 +236,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(stability_group)
         layout.addStretch(1)
 
-        self.translation_engine_combo.currentIndexChanged.connect(self._update_engine_stack)
-
         return tab
-
-    def _build_engine_nllb(self) -> QtWidgets.QWidget:
-        widget = QtWidgets.QWidget()
-        form = QtWidgets.QFormLayout(widget)
-        self.nllb_model_input = QtWidgets.QLineEdit()
-        form.addRow("NLLB model", self.nllb_model_input)
-        return widget
-
-    def _build_engine_ollama(self) -> QtWidgets.QWidget:
-        widget = QtWidgets.QWidget()
-        form = QtWidgets.QFormLayout(widget)
-        self.ollama_model_input = QtWidgets.QLineEdit()
-        self.ollama_host_input = QtWidgets.QLineEdit()
-        self.ollama_keep_alive_check = QtWidgets.QCheckBox("Keep model warm")
-        form.addRow("Ollama model", self.ollama_model_input)
-        form.addRow("Ollama host", self.ollama_host_input)
-        form.addRow("", self.ollama_keep_alive_check)
-        return widget
-
-    def _build_engine_openai(self) -> QtWidgets.QWidget:
-        widget = QtWidgets.QWidget()
-        form = QtWidgets.QFormLayout(widget)
-        self.openai_model_input = QtWidgets.QLineEdit()
-        self.openai_api_key_input = QtWidgets.QLineEdit()
-        self.openai_api_key_input.setEchoMode(QtWidgets.QLineEdit.Password)
-        self.openai_base_url_input = QtWidgets.QLineEdit()
-        form.addRow("OpenAI model", self.openai_model_input)
-        form.addRow("API key", self.openai_api_key_input)
-        form.addRow("Base URL", self.openai_base_url_input)
-        return widget
-
-    def _build_engine_noop(self) -> QtWidgets.QWidget:
-        widget = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(widget)
-        label = QtWidgets.QLabel("Translation disabled")
-        label.setAlignment(QtCore.Qt.AlignLeft)
-        layout.addWidget(label)
-        return widget
 
     def _apply_styles(self) -> None:
         self.setStyleSheet(
@@ -490,22 +357,25 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.force_close:
             event.accept()
             return
-        if self.tray and self.tray.isVisible():
-            event.ignore()
-            self.hide()
-            self.tray.showMessage("STT Backend", "Running in tray", QtWidgets.QSystemTrayIcon.Information, 1500)
-        else:
-            event.accept()
+        event.accept()
+        self._stop_backend()
+        QtWidgets.QApplication.quit()
 
-    def _update_engine_stack(self) -> None:
-        engine = self.translation_engine_combo.currentData()
-        index = {
-            "nllb": 0,
-            "ollama": 1,
-            "openai": 2,
-            "noop": 3,
-        }.get(engine, 0)
-        self.engine_stack.setCurrentIndex(index)
+    def changeEvent(self, event: QtCore.QEvent) -> None:
+        if (
+            event.type() == QtCore.QEvent.WindowStateChange
+            and self.isMinimized()
+            and self.tray
+            and self.tray.isVisible()
+        ):
+            QtCore.QTimer.singleShot(0, self.hide)
+            self.tray.showMessage(
+                "STT Backend",
+                "Minimized to tray",
+                QtWidgets.QSystemTrayIcon.Information,
+                1500,
+            )
+        super().changeEvent(event)
 
     def _update_ws_url(self) -> None:
         host = self.host_input.text().strip() or "127.0.0.1"
@@ -771,46 +641,15 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg = copy.deepcopy(self.config)
         cfg["server"] = dict(cfg.get("server") or {})
         cfg["stt"] = dict(cfg.get("stt") or {})
-        cfg["translation"] = dict(cfg.get("translation") or {})
         cfg["subtitle"] = dict(cfg.get("subtitle") or {})
 
         cfg["server"]["host"] = self.host_input.text().strip() or "127.0.0.1"
         cfg["server"]["port"] = int(self.port_input.value())
 
-        model_name = self.model_select_combo.currentData() or "medium"
+        cfg["stt"].pop("simulstreaming", None)
         model_dir = self._get_model_dir()
         cfg["stt"]["model_cache_dir"] = str(model_dir)
-        if model_name in WHISPER_MODEL_URLS:
-            cfg["stt"]["model"] = model_name
-            cfg["stt"].pop("model_path", None)
-        else:
-            cfg["stt"]["model"] = model_name
-            cfg["stt"]["model_path"] = str(model_dir / model_filename(model_name))
-
-        cfg["translation"]["engine"] = self.translation_engine_combo.currentData() or "nllb"
-        target_language = self.translation_language_combo.currentData() or "auto"
-        cfg["translation"]["target_language"] = target_language
-        cfg["translation"]["partial"] = bool(self.translation_partial_check.isChecked())
-        cfg["translation"]["debounce_ms"] = int(self.translation_debounce_input.value())
-
-        cfg["translation"].setdefault("nllb", {})
-        cfg["translation"]["nllb"]["model"] = self.nllb_model_input.text().strip()
-
-        cfg["translation"].setdefault("ollama", {})
-        cfg["translation"]["ollama"]["model"] = self.ollama_model_input.text().strip()
-        cfg["translation"]["ollama"]["host"] = self.ollama_host_input.text().strip()
-        keep_alive_value = self._ollama_keep_alive_value
-        if self.ollama_keep_alive_check.isChecked():
-            if not _keep_alive_enabled(keep_alive_value):
-                keep_alive_value = OLLAMA_KEEP_ALIVE_DEFAULT
-            cfg["translation"]["ollama"]["keep_alive"] = keep_alive_value
-        else:
-            cfg["translation"]["ollama"]["keep_alive"] = 0
-
-        cfg["translation"].setdefault("openai", {})
-        cfg["translation"]["openai"]["model"] = self.openai_model_input.text().strip()
-        cfg["translation"]["openai"]["api_key"] = self.openai_api_key_input.text().strip()
-        cfg["translation"]["openai"]["base_url"] = self.openai_base_url_input.text().strip()
+        cfg["stt"].pop("model_path", None)
 
         cfg["subtitle"]["max_chars"] = int(self.subtitle_max_chars_input.value())
         cfg["subtitle"]["max_sentences_default"] = int(
@@ -827,11 +666,6 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg["stt"]["stall_check_interval_sec"] = int(
             self.stall_check_interval_input.value()
         )
-        cfg["stt"].setdefault("simulstreaming", {})
-        cfg["stt"]["simulstreaming"]["max_context_tokens"] = int(
-            self.max_context_tokens_input.value()
-        )
-
         return cfg
 
     def _load_config_into_ui(self, cfg: Dict[str, Any]) -> None:
@@ -864,51 +698,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if model_index is not None:
             self.model_select_combo.setCurrentIndex(model_index)
-
-        translation_cfg = cfg.get("translation", {})
-        engine = translation_cfg.get("engine", "nllb")
-        engine_index = next(
-            (i for i in range(self.translation_engine_combo.count()) if self.translation_engine_combo.itemData(i) == engine),
-            0,
-        )
-        self.translation_engine_combo.setCurrentIndex(engine_index)
-        self._update_engine_stack()
-
-        language = translation_cfg.get("target_language", "auto")
-        language_index = next(
-            (i for i in range(self.translation_language_combo.count()) if self.translation_language_combo.itemData(i) == language),
-            0,
-        )
-        self.translation_language_combo.setCurrentIndex(language_index)
-        self.translation_partial_check.setChecked(bool(translation_cfg.get("partial", False)))
-        try:
-            self.translation_debounce_input.setValue(
-                int(
-                    translation_cfg.get(
-                        "debounce_ms", TRANSLATION_DEBOUNCE_MS_DEFAULT
-                    )
-                )
-            )
-        except (TypeError, ValueError):
-            self.translation_debounce_input.setValue(TRANSLATION_DEBOUNCE_MS_DEFAULT)
-
-        nllb_cfg = translation_cfg.get("nllb", {})
-        self.nllb_model_input.setText(str(nllb_cfg.get("model", "")))
-
-        ollama_cfg = translation_cfg.get("ollama", {})
-        self.ollama_model_input.setText(str(ollama_cfg.get("model", "")))
-        self.ollama_host_input.setText(str(ollama_cfg.get("host", "")))
-        raw_keep_alive = ollama_cfg.get("keep_alive")
-        normalized_keep_alive = _coerce_keep_alive_value(raw_keep_alive)
-        self._ollama_keep_alive_value = normalized_keep_alive
-        self.ollama_keep_alive_check.setChecked(
-            _keep_alive_enabled(normalized_keep_alive)
-        )
-
-        openai_cfg = translation_cfg.get("openai", {})
-        self.openai_model_input.setText(str(openai_cfg.get("model", "")))
-        self.openai_api_key_input.setText(str(openai_cfg.get("api_key", "")))
-        self.openai_base_url_input.setText(str(openai_cfg.get("base_url", "")))
 
         subtitle_cfg = cfg.get("subtitle", {})
         try:
@@ -951,14 +740,6 @@ class MainWindow(QtWidgets.QMainWindow):
             bool(subtitle_cfg.get("show_partial", SUBTITLE_SHOW_PARTIAL_DEFAULT))
         )
 
-        stt_cfg = cfg.get("stt", {})
-        simul_cfg = stt_cfg.get("simulstreaming", {})
-        try:
-            self.max_context_tokens_input.setValue(
-                int(simul_cfg.get("max_context_tokens", MAX_CONTEXT_TOKENS_DEFAULT))
-            )
-        except (TypeError, ValueError):
-            self.max_context_tokens_input.setValue(MAX_CONTEXT_TOKENS_DEFAULT)
         try:
             self.stall_timeout_input.setValue(
                 int(stt_cfg.get("stall_timeout_sec", STALL_TIMEOUT_DEFAULT))
@@ -967,7 +748,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.stall_timeout_input.setValue(STALL_TIMEOUT_DEFAULT)
         try:
             self.stall_check_interval_input.setValue(
-                int(stt_cfg.get("stall_check_interval_sec", STALL_CHECK_INTERVAL_DEFAULT))
+                int(
+                    stt_cfg.get(
+                        "stall_check_interval_sec", STALL_CHECK_INTERVAL_DEFAULT
+                    )
+                )
             )
         except (TypeError, ValueError):
             self.stall_check_interval_input.setValue(STALL_CHECK_INTERVAL_DEFAULT)

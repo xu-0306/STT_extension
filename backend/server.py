@@ -1,11 +1,13 @@
 import asyncio
+import gc
+import logging
+import inspect
 import ipaddress
 import json
 import re
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -13,14 +15,44 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from whisperlivekit import AudioProcessor, TranscriptionEngine
 
+logger = logging.getLogger(__name__)
+
+
+def _patch_whisperlivekit_asrtoken() -> None:
+    try:
+        from whisperlivekit.local_agreement import backends as la_backends
+    except Exception:
+        return
+    asr_token = getattr(la_backends, "ASRToken", None)
+    if asr_token is None:
+        return
+    try:
+        sig = inspect.signature(asr_token.__init__)
+    except (TypeError, ValueError):
+        return
+    if "probability" in sig.parameters:
+        return
+
+    original_init = asr_token.__init__
+
+    def _init(self, *args, probability=None, **kwargs):
+        return original_init(self, *args, **kwargs)
+
+    asr_token.__init__ = _init
+    logger.warning("Patched whisperlivekit.ASRToken to ignore unsupported 'probability' kwarg.")
+
 try:
+    from . import model_manager
     from .cache import LRUCache
     from .config import load_config
     from .translator import build_translator
 except ImportError:  # Fallback when running as a script.
+    import model_manager
     from cache import LRUCache
     from config import load_config
     from translator import build_translator
+
+_patch_whisperlivekit_asrtoken()
 
 
 def _get_server_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -45,68 +77,31 @@ def _merge_config(base: Dict[str, Any], update: Optional[Dict[str, Any]]) -> Dic
     return merged
 
 
+_ALLOWED_STT_UPDATE_KEYS = {
+    "model",
+    "language",
+    "backend",
+    "min_chunk_size",
+    "buffer_trimming",
+    "buffer_trimming_sec",
+    "confidence_validation",
+    "pcm_input",
+    "vad",
+    "vac",
+    "vac_chunk_size",
+    "stall_timeout_sec",
+    "stall_check_interval_sec",
+}
+
+
 def _normalize_stt_update(stt_update: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not stt_update or not isinstance(stt_update, dict):
         return {}
-    normalized = dict(stt_update)
-    if "model" in normalized and "model_path" not in normalized:
+    normalized = {k: v for k, v in stt_update.items() if k in _ALLOWED_STT_UPDATE_KEYS}
+    if "model" in normalized:
         # Ensure explicit model selection does not keep a stale model_path.
         normalized["model_path"] = None
-    if "model_cache_dir" in normalized and not normalized["model_cache_dir"]:
-        normalized["model_cache_dir"] = None
-    if "model_path" in normalized and not normalized["model_path"]:
-        normalized["model_path"] = None
     return normalized
-
-
-def _resolve_model_target(stt_cfg: Dict[str, Any]) -> Optional[Path]:
-    model_name = str(stt_cfg.get("model") or "").strip()
-    if not model_name:
-        return None
-    model_path = stt_cfg.get("model_path")
-    if model_path:
-        return Path(model_path)
-    model_cache_dir = stt_cfg.get("model_cache_dir")
-    if not model_cache_dir:
-        return None
-    return Path(model_cache_dir) / f"{model_name}.pt"
-
-
-def _download_model_file(
-    url: str,
-    target: Path,
-    progress_cb=None,
-) -> None:
-    import urllib.request
-
-    tmp_path = target.with_suffix(target.suffix + ".download")
-    if tmp_path.exists():
-        tmp_path.unlink()
-    try:
-        with urllib.request.urlopen(url) as response, tmp_path.open("wb") as handle:
-            total_size = None
-            try:
-                total_header = response.getheader("Content-Length")
-                if total_header:
-                    total_size = int(total_header)
-            except (TypeError, ValueError):
-                total_size = None
-            downloaded = 0
-            if progress_cb:
-                progress_cb(downloaded, total_size)
-            while True:
-                chunk = response.read(MODEL_DOWNLOAD_CHUNK_SIZE)
-                if not chunk:
-                    break
-                handle.write(chunk)
-                downloaded += len(chunk)
-                if progress_cb:
-                    progress_cb(downloaded, total_size)
-        tmp_path.replace(target)
-    except Exception:
-        if tmp_path.exists():
-            tmp_path.unlink()
-        raise
 
 
 async def _ensure_model_available(
@@ -117,102 +112,45 @@ async def _ensure_model_available(
     model_name = str(stt_cfg.get("model") or "").strip()
     if not model_name:
         return stt_cfg
-    url = WHISPER_MODEL_URLS.get(model_name)
-    if not url:
-        return stt_cfg
-    target = _resolve_model_target(stt_cfg)
-    if target is None:
-        return stt_cfg
-    if target.exists():
-        updated = dict(stt_cfg)
-        updated["model_path"] = str(target)
-        return updated
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-    except Exception as exc:
-        await _safe_send(
-            websocket,
-            {
-                "type": "error",
-                "message": f"Model cache dir error: {type(exc).__name__}",
-            },
+    loop = asyncio.get_running_loop()
+    progress_state = {"percent": -1, "mb": -1}
+
+    async def notify_cb(message: str) -> None:
+        await _safe_send(websocket, {"type": "status", "message": message})
+
+    def progress_cb(downloaded: int, total: Optional[int]) -> None:
+        if total:
+            percent = int(downloaded * 100 / total)
+            if percent == progress_state["percent"]:
+                return
+            if percent < 100 and percent - progress_state["percent"] < 5:
+                return
+            progress_state["percent"] = percent
+            message = f"Downloading Whisper model ({model_name}): {percent}%"
+        else:
+            mb = int(downloaded / (1024 * 1024))
+            if mb == progress_state["mb"]:
+                return
+            progress_state["mb"] = mb
+            message = f"Downloading Whisper model ({model_name}): {mb} MB"
+        loop.call_soon_threadsafe(
+            asyncio.create_task,
+            _safe_send(websocket, {"type": "status", "message": message}),
         )
-        raise
-    async with download_lock:
-        if target.exists():
-            updated = dict(stt_cfg)
-            updated["model_path"] = str(target)
-            return updated
-        await _safe_send(
-            websocket,
-            {"type": "status", "message": f"Downloading Whisper model: {model_name}"},
-        )
-        loop = asyncio.get_running_loop()
-        last_progress = {"percent": -1, "bytes": 0, "ts": 0.0}
 
-        def _format_mb(value: int) -> str:
-            return f"{value / (1024 * 1024):.1f}"
-
-        def _report_progress(downloaded: int, total: Optional[int]) -> None:
-            now = time.monotonic()
-            if total and total > 0:
-                percent = int(downloaded * 100 / total)
-                if percent <= last_progress["percent"] and now - last_progress["ts"] < 1.0:
-                    return
-                last_progress["percent"] = percent
-                message = (
-                    f"Downloading Whisper model: {model_name} "
-                    f"({percent}%, {_format_mb(downloaded)}/{_format_mb(total)} MB)"
-                )
-            else:
-                if (
-                    downloaded - last_progress["bytes"] < 5 * 1024 * 1024
-                    and now - last_progress["ts"] < 1.0
-                ):
-                    return
-                last_progress["bytes"] = downloaded
-                message = (
-                    f"Downloading Whisper model: {model_name} "
-                    f"({_format_mb(downloaded)} MB)"
-                )
-            last_progress["ts"] = now
-
-            def _emit() -> None:
-                asyncio.create_task(
-                    _safe_send(websocket, {"type": "status", "message": message})
-                )
-
-            loop.call_soon_threadsafe(_emit)
-
-        try:
-            await asyncio.to_thread(_download_model_file, url, target, _report_progress)
-        except Exception as exc:
-            await _safe_send(
-                websocket,
-                {
-                    "type": "error",
-                    "message": f"Model download failed: {type(exc).__name__}",
-                },
-            )
-            raise
-        await _safe_send(
-            websocket,
-            {"type": "status", "message": f"Model downloaded: {model_name}"},
-        )
-    updated = dict(stt_cfg)
-    updated["model_path"] = str(target)
-    return updated
+    return await model_manager.ensure_model_available(
+        stt_cfg,
+        notify_cb=notify_cb,
+        progress_cb=progress_cb,
+        download_lock=download_lock,
+    )
 
 
 def _build_engine_kwargs(stt_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    simul_cfg = stt_cfg.get("simulstreaming", {}) if isinstance(stt_cfg, dict) else {}
-    max_context_tokens = simul_cfg.get("max_context_tokens")
-    if max_context_tokens is None:
-        max_context_tokens = DEFAULT_MAX_CONTEXT_TOKENS
     return {
         "model_size": stt_cfg.get("model", "medium"),
         "lan": stt_cfg.get("language", "auto"),
-        "backend_policy": stt_cfg.get("backend_policy", "simulstreaming"),
+        "backend_policy": stt_cfg.get("backend_policy", "localagreement"),
         "backend": stt_cfg.get("backend", "auto"),
         "min_chunk_size": float(stt_cfg.get("min_chunk_size", 0.1)),
         "buffer_trimming": stt_cfg.get("buffer_trimming", "segment"),
@@ -226,18 +164,6 @@ def _build_engine_kwargs(stt_cfg: Dict[str, Any]) -> Dict[str, Any]:
         "model_dir": stt_cfg.get("model_dir"),
         "model_path": stt_cfg.get("model_path"),
         "lora_path": stt_cfg.get("lora_path"),
-        "disable_fast_encoder": bool(simul_cfg.get("disable_fast_encoder", False)),
-        "custom_alignment_heads": simul_cfg.get("custom_alignment_heads"),
-        "frame_threshold": int(simul_cfg.get("frame_threshold", 25)),
-        "beams": int(simul_cfg.get("beams", 1)),
-        "decoder_type": simul_cfg.get("decoder_type"),
-        "audio_max_len": float(simul_cfg.get("audio_max_len", 30.0)),
-        "audio_min_len": float(simul_cfg.get("audio_min_len", 0.0)),
-        "cif_ckpt_path": simul_cfg.get("cif_ckpt_path"),
-        "never_fire": bool(simul_cfg.get("never_fire", False)),
-        "init_prompt": simul_cfg.get("init_prompt"),
-        "static_init_prompt": simul_cfg.get("static_init_prompt"),
-        "max_context_tokens": max_context_tokens,
         "target_language": "",
     }
 
@@ -262,6 +188,39 @@ def _release_torch_cache() -> None:
             torch.cuda.empty_cache()
     except Exception:
         pass
+
+
+def _release_memory() -> None:
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    _release_torch_cache()
+
+
+def _log_cuda_memory(label: str) -> None:
+    try:
+        import torch
+    except Exception:
+        return
+    try:
+        if not torch.cuda.is_available():
+            return
+        mb = 1024 * 1024
+        allocated = torch.cuda.memory_allocated() / mb
+        reserved = torch.cuda.memory_reserved() / mb
+        max_alloc = torch.cuda.max_memory_allocated() / mb
+        max_reserved = torch.cuda.max_memory_reserved() / mb
+        logger.info(
+            "CUDA mem %s: alloc=%.1fMB reserved=%.1fMB max_alloc=%.1fMB max_reserved=%.1fMB",
+            label,
+            allocated,
+            reserved,
+            max_alloc,
+            max_reserved,
+        )
+    except Exception:
+        return
 
 
 def _pick_latest_segment(lines: list[Any]) -> Optional[Any]:
@@ -296,7 +255,6 @@ MAX_DISPLAY_CHARS = 260
 MAX_SENTENCES_DEFAULT = 2
 MAX_SENTENCES_CJK = 1
 DEFAULT_TRANSLATION_DEBOUNCE_MS = 300
-DEFAULT_MAX_CONTEXT_TOKENS = 64
 DEFAULT_STALL_TIMEOUT_SEC = 15.0
 DEFAULT_STALL_CHECK_INTERVAL_SEC = 5.0
 DEFAULT_SEGMENT_MAX_CHARS = 160
@@ -306,14 +264,6 @@ SENTENCE_ENDINGS = {".", "!", "?", "\u3002", "\uff01", "\uff1f", "\u2026"}
 CLOSING_PUNCTUATION = {")", "]", "}", "\"", "'"}
 CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\u31f0-\u31ff]")
 
-MODEL_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
-WHISPER_MODEL_URLS = {
-    "tiny": "https://openaipublic.azureedge.net/main/whisper/models/65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9/tiny.pt",
-    "base": "https://openaipublic.azureedge.net/main/whisper/models/ed3a0b6b1c0edf879ad9b11b1af5a0e6ab5db9205f891f668f8b0e6c6326e34e/base.pt",
-    "small": "https://openaipublic.azureedge.net/main/whisper/models/9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794/small.pt",
-    "medium": "https://openaipublic.azureedge.net/main/whisper/models/345ae4da62f9b3d59415adc60127b97c714f32e89e936602e85993674d08dcb1/medium.pt",
-    "large-v3": "https://openaipublic.azureedge.net/main/whisper/models/e5b1a55b89c1367dacf97e3e19bfd829a01529dbfdeefa8caeb59b3f1b81dadb/large-v3.pt",
-}
 
 
 def _normalize_text(text: str) -> str:
@@ -546,6 +496,11 @@ class SttSession:
         self.last_result_ts = time.monotonic()
         self.result_seen = False
         self.reset_lock = asyncio.Lock()
+        now = time.monotonic()
+        self.engine_start_ts = now
+        self.last_cleanup_ts = now
+        self.last_gpu_log_ts = 0.0
+        self.engine_builds = 1
 
 
 async def _safe_send(websocket: WebSocket, payload: Dict[str, Any]) -> bool:
@@ -784,6 +739,7 @@ async def _apply_stt_update(
             },
         )
         return
+    old_engine = stt_session.engine
     stt_session.cfg = merged_cfg
     stt_session.default_language = str(merged_cfg.get("language", "auto"))
     stt_session.engine = new_engine
@@ -791,6 +747,14 @@ async def _apply_stt_update(
     stt_session.last_result_ts = time.monotonic()
     stt_session.result_seen = False
     translation_session.default_lang = stt_session.default_language
+    stt_session.engine_builds += 1
+    gpu_log_interval_sec = _normalize_timeout(
+        stt_session.cfg.get("gpu_log_interval_sec"), 0.0
+    )
+    if gpu_log_interval_sec > 0:
+        _log_cuda_memory("engine update")
+    old_engine = None
+    _release_memory()
     await _safe_send(
         websocket,
         {
@@ -1025,9 +989,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     except Exception:
         await websocket.close(code=1011)
         return
+    gpu_log_interval_sec = _normalize_timeout(
+        stt_cfg.get("gpu_log_interval_sec"), 0.0
+    )
     engine_kwargs = _build_engine_kwargs(stt_cfg)
     engine_kwargs["pcm_input"] = bool(stt_cfg.get("pcm_input", False))
     stt_engine = TranscriptionEngine(**engine_kwargs)
+    if gpu_log_interval_sec > 0:
+        _log_cuda_memory("engine init")
     translator = await _resolve_translator(app.state.translator_cache, translation_cfg)
     audio_processor = AudioProcessor(
         transcription_engine=stt_engine,
@@ -1050,11 +1019,16 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         stt_cfg.get("stall_check_interval_sec"),
         DEFAULT_STALL_CHECK_INTERVAL_SEC,
     )
+    recycle_sec = _normalize_timeout(stt_cfg.get("engine_recycle_sec"), 0.0)
+    cleanup_interval_sec = _normalize_timeout(
+        stt_cfg.get("memory_cleanup_interval_sec"), 0.0
+    )
 
     async def _reset_stt_engine(reason: str, rebuild_engine: bool = True) -> None:
         nonlocal audio_processor, stt_engine, results_generator, results_task
         async with stt_session.reset_lock:
             try:
+                old_engine = stt_engine
                 if session.translation_task and not session.translation_task.done():
                     session.translation_task.cancel()
                     try:
@@ -1081,12 +1055,16 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         pass
                 await _close_results_generator(results_generator)
                 await audio_processor.cleanup()
+                _release_memory()
                 if rebuild_engine:
                     engine_kwargs = _build_engine_kwargs(stt_session.cfg)
                     engine_kwargs["pcm_input"] = bool(
                         stt_session.cfg.get("pcm_input", False)
                     )
                     stt_engine = TranscriptionEngine(**engine_kwargs)
+                    stt_session.engine_builds += 1
+                    if gpu_log_interval_sec > 0:
+                        _log_cuda_memory(f"engine rebuild ({reason})")
                 audio_processor = AudioProcessor(transcription_engine=stt_engine)
                 stt_session.engine = stt_engine
                 stt_session.audio_processor = audio_processor
@@ -1094,7 +1072,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 stt_session.last_audio_ts = time.monotonic()
                 stt_session.last_result_ts = time.monotonic()
                 stt_session.result_seen = False
-                _release_torch_cache()
+                stt_session.engine_start_ts = time.monotonic()
+                stt_session.last_cleanup_ts = stt_session.engine_start_ts
+                old_engine = None
+                _release_memory()
                 results_generator = await audio_processor.create_tasks()
                 results_task = asyncio.create_task(
                     _handle_results(websocket, results_generator, session, stt_session)
@@ -1110,26 +1091,42 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 )
 
     async def _stt_watchdog() -> None:
-        if stall_check_interval <= 0 or stall_timeout <= 0:
+        if (
+            stall_check_interval <= 0 or stall_timeout <= 0
+        ) and cleanup_interval_sec <= 0 and recycle_sec <= 0:
             return
+        watchdog_interval = stall_check_interval if stall_check_interval > 0 else 1.0
         while True:
             try:
-                await asyncio.sleep(stall_check_interval)
+                await asyncio.sleep(watchdog_interval)
             except asyncio.CancelledError:
                 return
             if stt_session.first_audio_ts is None:
-                continue
+                if cleanup_interval_sec <= 0 and recycle_sec <= 0:
+                    continue
             if stt_session.reset_lock.locked():
                 continue
             now = time.monotonic()
-            if now - stt_session.last_audio_ts > stall_timeout:
-                continue
-            if stt_session.result_seen:
-                if now - stt_session.last_result_ts > stall_timeout:
-                    await _reset_stt_engine("stall", rebuild_engine=False)
-            else:
-                if now - stt_session.first_audio_ts > stall_timeout * 2:
-                    await _reset_stt_engine("no results", rebuild_engine=False)
+            if gpu_log_interval_sec > 0:
+                if now - stt_session.last_gpu_log_ts >= gpu_log_interval_sec:
+                    stt_session.last_gpu_log_ts = now
+                    _log_cuda_memory(f"watchdog engines={stt_session.engine_builds}")
+            if cleanup_interval_sec > 0:
+                if now - stt_session.last_cleanup_ts >= cleanup_interval_sec:
+                    _release_memory()
+                    stt_session.last_cleanup_ts = now
+            if recycle_sec > 0:
+                if now - stt_session.engine_start_ts >= recycle_sec:
+                    await _reset_stt_engine("recycle", rebuild_engine=True)
+            if stall_check_interval > 0 and stall_timeout > 0:
+                if now - stt_session.last_audio_ts > stall_timeout:
+                    continue
+                if stt_session.result_seen:
+                    if now - stt_session.last_result_ts > stall_timeout:
+                        await _reset_stt_engine("stall", rebuild_engine=False)
+                else:
+                    if now - stt_session.first_audio_ts > stall_timeout * 2:
+                        await _reset_stt_engine("no results", rebuild_engine=False)
 
     watchdog_task = asyncio.create_task(_stt_watchdog())
 
@@ -1260,6 +1257,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 await results_task
             except asyncio.CancelledError:
                 pass
+        await _close_results_generator(results_generator)
         if session.translation_task and not session.translation_task.done():
             session.translation_task.cancel()
             try:
@@ -1273,6 +1271,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             except asyncio.CancelledError:
                 pass
         await audio_processor.cleanup()
+        _release_memory()
         # No global WS lock; each connection is handled independently.
 
 

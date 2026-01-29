@@ -8,7 +8,7 @@ stt:
   model: "medium" # tiny, base, small, medium, large-v3
   model_cache_dir: "" # optional; leave empty to use the default cache directory
   language: "auto" # auto, en, ja, zh
-  backend_policy: "simulstreaming" # simulstreaming or localagreement
+  backend_policy: "localagreement"
   backend: "auto" # auto, faster-whisper, whisper, openai-api
   min_chunk_size: 0.1
   buffer_trimming: "segment"
@@ -20,17 +20,9 @@ stt:
   vac_chunk_size: 0.04
   stall_timeout_sec: 15
   stall_check_interval_sec: 5
-  simulstreaming:
-    frame_threshold: 25
-    beams: 1
-    decoder_type: null
-    audio_max_len: 30
-    audio_min_len: 0.0
-    cif_ckpt_path: null
-    never_fire: false
-    init_prompt: null
-    static_init_prompt: null
-    max_context_tokens: 64
+  engine_recycle_sec: 0 # rebuild STT engine periodically to release memory (0 disables)
+  memory_cleanup_interval_sec: 60 # run gc/empty_cache periodically (0 disables)
+  gpu_log_interval_sec: 0 # log CUDA memory stats every N seconds (0 disables)
 
 translation:
   engine: "nllb" # nllb, ollama, openai, noop

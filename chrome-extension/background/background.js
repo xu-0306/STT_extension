@@ -97,6 +97,29 @@ async function ensureOffscreenDocument() {
   });
 }
 
+async function getActiveCaptureTabIds() {
+  return new Promise((resolve) => {
+    if (!chrome.tabCapture?.getCapturedTabs) {
+      resolve([]);
+      return;
+    }
+    chrome.tabCapture.getCapturedTabs((tabs) => {
+      if (chrome.runtime.lastError || !Array.isArray(tabs)) {
+        resolve([]);
+        return;
+      }
+      resolve(tabs.map((tab) => tab.tabId).filter(Number.isInteger));
+    });
+  });
+}
+
+async function ensureCaptureReleased(tabId) {
+  const activeTabs = await getActiveCaptureTabIds();
+  if (!activeTabs.includes(tabId)) return;
+  await stopCapture(tabId);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+}
+
 async function startCapture(tabId, wsUrl, settings) {
   const targetTabId = await resolveTabId(tabId);
   if (!targetTabId) {
@@ -105,9 +128,23 @@ async function startCapture(tabId, wsUrl, settings) {
   try {
     await ensureContentScript(targetTabId);
     await ensureOffscreenDocument();
-    const streamId = await chrome.tabCapture.getMediaStreamId({
-      targetTabId,
-    });
+    await ensureCaptureReleased(targetTabId);
+    let streamId;
+    try {
+      streamId = await chrome.tabCapture.getMediaStreamId({
+        targetTabId,
+      });
+    } catch (err) {
+      const message = err?.message || "";
+      if (message.includes("active stream")) {
+        await ensureCaptureReleased(targetTabId);
+        streamId = await chrome.tabCapture.getMediaStreamId({
+          targetTabId,
+        });
+      } else {
+        throw err;
+      }
+    }
     const response = await sendOffscreenMessage({
       type: "offscreen-start",
       tabId: targetTabId,
@@ -260,6 +297,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
       if (!running) {
         const lowered = String(statusText).toLowerCase();
+        if (
+          lowered.includes("disconnected") ||
+          lowered.includes("websocket error") ||
+          lowered.includes("stopped")
+        ) {
+          sendSubtitleToTab(message.tabId, { type: "subtitle-remove" });
+        }
         if (lowered.includes("disconnected") || lowered.includes("websocket error")) {
           restartCapture(message.tabId, statusText);
         }
