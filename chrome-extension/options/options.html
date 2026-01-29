@@ -94,6 +94,35 @@
           <div id="translationModelList" class="model-list"></div>
         </section>
 
+        <section class="settings-card">
+          <h2>Subtitle Behavior</h2>
+          <div class="settings-form">
+            <div class="settings-row">
+              <span class="row-label">History lines</span>
+              <span id="subtitleHistoryLinesValue" class="row-value">2</span>
+            </div>
+            <input
+              id="subtitleHistoryLines"
+              type="range"
+              min="1"
+              max="4"
+              step="1"
+              value="2"
+            />
+            <div class="settings-row">
+              <span class="row-label">Show partial line</span>
+              <span id="subtitleShowPartialValue" class="row-value">On</span>
+            </div>
+            <div class="select-wrap">
+              <select id="subtitleShowPartial">
+                <option value="on" selected>On</option>
+                <option value="off">Off</option>
+              </select>
+            </div>
+            <p class="hint">Keep recent lines visible while partials update below.</p>
+          </div>
+        </section>
+
         <div id="status" class="status" data-state="idle">Idle</div>
       </section>
 

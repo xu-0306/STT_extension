@@ -5,14 +5,21 @@ const LEGACY_FONT_SCALE_KEY = "subtitleFontScale";
 const TARGET_LANGUAGE_KEY = "translationTargetLanguage";
 const STT_MODEL_SIZE_KEY = "sttModelSize";
 const OVERLAY_OPACITY_KEY = "subtitleOverlayOpacity";
+const HISTORY_LINES_KEY = "subtitleHistoryLines";
+const SHOW_PARTIAL_KEY = "subtitleShowPartial";
 const DEFAULT_FONT_SCALE = 1;
 const MIN_FONT_SCALE = 0.7;
 const MAX_FONT_SCALE = 1.6;
 const DEFAULT_OVERLAY_OPACITY = 0.85;
 const MIN_OVERLAY_OPACITY = 0.35;
 const MAX_OVERLAY_OPACITY = 1;
+const DEFAULT_HISTORY_LINES = 2;
+const MIN_HISTORY_LINES = 1;
+const MAX_HISTORY_LINES = 4;
+const DEFAULT_SHOW_PARTIAL = true;
 const DEFAULT_STT_MODEL_SIZE = "medium";
 const DEFAULT_TARGET_LANGUAGE = "zh-TW";
+const LEGACY_DEFAULT_TARGET_LANGUAGE = "zh-CN";
 
 const DEFAULT_TRANSLATION_MODELS = [
   {
@@ -59,6 +66,10 @@ const subtitleTranslatedSizeInput = document.getElementById("subtitleTranslatedS
 const subtitleTranslatedSizeValue = document.getElementById("subtitleTranslatedSizeValue");
 const overlayOpacityInput = document.getElementById("overlayOpacity");
 const overlayOpacityValue = document.getElementById("overlayOpacityValue");
+const subtitleHistoryLinesInput = document.getElementById("subtitleHistoryLines");
+const subtitleHistoryLinesValue = document.getElementById("subtitleHistoryLinesValue");
+const subtitleShowPartialSelect = document.getElementById("subtitleShowPartial");
+const subtitleShowPartialValue = document.getElementById("subtitleShowPartialValue");
 
 const newTranslationNameInput = document.getElementById("newTranslationName");
 const newTranslationEngineSelect = document.getElementById("newTranslationEngine");
@@ -95,6 +106,14 @@ const LANGUAGE_OPTIONS = [
   { id: "vi", name: "Vietnamese" },
   { id: "th", name: "Thai" },
 ];
+
+function normalizeTargetLanguage(value) {
+  if (!value) return DEFAULT_TARGET_LANGUAGE;
+  if (value === LEGACY_DEFAULT_TARGET_LANGUAGE) {
+    return DEFAULT_TARGET_LANGUAGE;
+  }
+  return value;
+}
 
 function setStatus(text, stateName) {
   if (!statusEl) return;
@@ -223,6 +242,44 @@ function updateOpacityUI(inputEl, valueEl, opacity) {
   return clamped;
 }
 
+function clampHistoryLines(value) {
+  const numeric = Number.parseInt(value, 10);
+  if (!Number.isFinite(numeric)) return DEFAULT_HISTORY_LINES;
+  return Math.min(Math.max(MIN_HISTORY_LINES, numeric), MAX_HISTORY_LINES);
+}
+
+function normalizeShowPartial(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value > 0;
+  if (typeof value === "string") {
+    const lowered = value.trim().toLowerCase();
+    if (["off", "false", "0", "no"].includes(lowered)) return false;
+    if (["on", "true", "1", "yes"].includes(lowered)) return true;
+  }
+  return DEFAULT_SHOW_PARTIAL;
+}
+
+function updateHistoryUI(inputEl, valueEl, lines) {
+  const clamped = clampHistoryLines(lines);
+  if (!inputEl) return clamped;
+  inputEl.value = String(clamped);
+  if (valueEl) {
+    valueEl.textContent = String(clamped);
+  }
+  return clamped;
+}
+
+function updateShowPartialUI(selectEl, valueEl, enabled) {
+  const normalized = normalizeShowPartial(enabled);
+  if (selectEl) {
+    selectEl.value = normalized ? "on" : "off";
+  }
+  if (valueEl) {
+    valueEl.textContent = normalized ? "On" : "Off";
+  }
+  return normalized;
+}
+
 function renderModelList(container, models, onUse, onRemove, onTest) {
   if (!container) return;
   container.innerHTML = "";
@@ -318,6 +375,8 @@ async function loadState() {
     TARGET_LANGUAGE_KEY,
     STT_MODEL_SIZE_KEY,
     OVERLAY_OPACITY_KEY,
+    HISTORY_LINES_KEY,
+    SHOW_PARTIAL_KEY,
   ]);
 
   const { data: normalized, changed } = ensureDefaults(data);
@@ -330,7 +389,8 @@ async function loadState() {
   wsInput.value = normalized.wsUrl || DEFAULT_WS_URL;
   state.translationModels = normalized.translationModels || DEFAULT_TRANSLATION_MODELS.slice();
   state.selectedTranslationModel = normalized.selectedTranslationModel || "";
-  state.translationTargetLanguage = data[TARGET_LANGUAGE_KEY] || DEFAULT_TARGET_LANGUAGE;
+  const normalizedTargetLanguage = normalizeTargetLanguage(data[TARGET_LANGUAGE_KEY]);
+  state.translationTargetLanguage = normalizedTargetLanguage;
   state.sttModelSize = data[STT_MODEL_SIZE_KEY] || DEFAULT_STT_MODEL_SIZE;
 
   renderTranslationSelect();
@@ -359,6 +419,16 @@ async function loadState() {
     overlayOpacityValue,
     data[OVERLAY_OPACITY_KEY] ?? DEFAULT_OVERLAY_OPACITY
   );
+  const historyLinesValue = updateHistoryUI(
+    subtitleHistoryLinesInput,
+    subtitleHistoryLinesValue,
+    data[HISTORY_LINES_KEY] ?? DEFAULT_HISTORY_LINES
+  );
+  const showPartialValue = updateShowPartialUI(
+    subtitleShowPartialSelect,
+    subtitleShowPartialValue,
+    data[SHOW_PARTIAL_KEY] ?? DEFAULT_SHOW_PARTIAL
+  );
   if (hasLegacy && (data[FONT_ORIGINAL_SCALE_KEY] === undefined || data[FONT_TRANSLATED_SCALE_KEY] === undefined)) {
     storageSet({
       [FONT_ORIGINAL_SCALE_KEY]: clampedOriginal,
@@ -368,11 +438,20 @@ async function loadState() {
   if (data[OVERLAY_OPACITY_KEY] === undefined) {
     storageSet({ [OVERLAY_OPACITY_KEY]: opacityValue });
   }
+  if (data[HISTORY_LINES_KEY] === undefined) {
+    storageSet({ [HISTORY_LINES_KEY]: historyLinesValue });
+  }
+  if (data[SHOW_PARTIAL_KEY] === undefined) {
+    storageSet({ [SHOW_PARTIAL_KEY]: showPartialValue });
+  }
   if (data[STT_MODEL_SIZE_KEY] === undefined) {
     storageSet({ [STT_MODEL_SIZE_KEY]: state.sttModelSize });
   }
-  if (data[TARGET_LANGUAGE_KEY] === undefined) {
-    storageSet({ [TARGET_LANGUAGE_KEY]: state.translationTargetLanguage });
+  if (
+    data[TARGET_LANGUAGE_KEY] === undefined ||
+    normalizedTargetLanguage !== data[TARGET_LANGUAGE_KEY]
+  ) {
+    storageSet({ [TARGET_LANGUAGE_KEY]: normalizedTargetLanguage });
   }
   renderModelList(
     translationModelList,
@@ -557,6 +636,22 @@ if (overlayOpacityInput) {
     const opacity = clampOpacity(overlayOpacityInput.value);
     updateOpacityUI(overlayOpacityInput, overlayOpacityValue, opacity);
     storageSet({ [OVERLAY_OPACITY_KEY]: opacity });
+  });
+}
+
+if (subtitleHistoryLinesInput) {
+  subtitleHistoryLinesInput.addEventListener("input", () => {
+    const lines = clampHistoryLines(subtitleHistoryLinesInput.value);
+    updateHistoryUI(subtitleHistoryLinesInput, subtitleHistoryLinesValue, lines);
+    storageSet({ [HISTORY_LINES_KEY]: lines });
+  });
+}
+
+if (subtitleShowPartialSelect) {
+  subtitleShowPartialSelect.addEventListener("change", () => {
+    const enabled = normalizeShowPartial(subtitleShowPartialSelect.value);
+    updateShowPartialUI(subtitleShowPartialSelect, subtitleShowPartialValue, enabled);
+    storageSet({ [SHOW_PARTIAL_KEY]: enabled });
   });
 }
 

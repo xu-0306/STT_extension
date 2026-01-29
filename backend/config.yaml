@@ -6,6 +6,7 @@ server:
 
 stt:
   model: "medium" # tiny, base, small, medium, large-v3
+  model_cache_dir: "" # optional; leave empty to use the default cache directory
   language: "auto" # auto, en, ja, zh
   backend_policy: "simulstreaming" # simulstreaming or localagreement
   backend: "auto" # auto, faster-whisper, whisper, openai-api
@@ -17,7 +18,7 @@ stt:
   vad: true
   vac: true
   vac_chunk_size: 0.04
-  stall_timeout_sec: 25
+  stall_timeout_sec: 15
   stall_check_interval_sec: 5
   simulstreaming:
     frame_threshold: 25
@@ -29,7 +30,7 @@ stt:
     never_fire: false
     init_prompt: null
     static_init_prompt: null
-    max_context_tokens: 128
+    max_context_tokens: 64
 
 translation:
   engine: "nllb" # nllb, ollama, openai, noop
@@ -38,12 +39,15 @@ translation:
   translator_cache_size: 4 # max cached translator instances
   timeout_sec: 8.0 # translation timeout; set 0 for no timeout
   debounce_ms: 300 # delay before translating final text (0 disables)
+  segment_max_chars: 160 # force-translate when buffer exceeds this (0 disables)
+  segment_max_ms: 4000 # force-translate after this duration (0 disables)
   partial: false
   nllb:
     model: "facebook/nllb-200-distilled-600M"
   ollama:
     model: "gemma3:4b"
     host: "http://localhost:11434"
+    keep_alive: "5m"
   openai:
     model: "gpt-4o-mini"
     api_key: ""
@@ -53,4 +57,6 @@ subtitle:
   max_chars: 260
   max_sentences_default: 2
   max_sentences_cjk: 1
-  max_repeat_sentences: 2
+  max_repeat_sentences: 1
+  history_lines: 2
+  show_partial: true

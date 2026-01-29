@@ -1,5 +1,9 @@
 const OFFSCREEN_URL = chrome.runtime.getURL("offscreen/offscreen.html");
 const tabStatus = new Map();
+const captureSettings = new Map();
+const restartState = new Map();
+const MAX_RESTARTS = 3;
+const RESTART_WINDOW_MS = 30000;
 
 async function ensureContentScript(tabId) {
   if (!tabId) return false;
@@ -49,6 +53,40 @@ function sendOffscreenMessage(payload) {
   });
 }
 
+function tabExists(tabId) {
+  if (!chrome?.tabs?.get || !Number.isInteger(tabId)) {
+    return Promise.resolve(false);
+  }
+  return new Promise((resolve) => {
+    chrome.tabs.get(tabId, (tab) => {
+      if (chrome.runtime.lastError) {
+        resolve(false);
+        return;
+      }
+      resolve(Boolean(tab));
+    });
+  });
+}
+
+function getRestartState(tabId) {
+  const existing = restartState.get(tabId);
+  if (existing) return existing;
+  const state = { attempts: 0, windowStart: 0, inFlight: false };
+  restartState.set(tabId, state);
+  return state;
+}
+
+function rememberCaptureSettings(tabId, wsUrl, settings) {
+  if (!Number.isInteger(tabId)) return;
+  captureSettings.set(tabId, { wsUrl, settings });
+}
+
+function clearCaptureSettings(tabId) {
+  if (!Number.isInteger(tabId)) return;
+  captureSettings.delete(tabId);
+  restartState.delete(tabId);
+}
+
 async function ensureOffscreenDocument() {
   const hasDocument = await chrome.offscreen.hasDocument();
   if (hasDocument) return;
@@ -93,6 +131,47 @@ async function stopCapture(tabId) {
   await sendSubtitleToTab(targetTabId, { type: "subtitle-remove" });
 }
 
+async function restartCapture(tabId, reason) {
+  const settings = captureSettings.get(tabId);
+  if (!settings) return;
+  const state = getRestartState(tabId);
+  if (state.inFlight) return;
+  const now = Date.now();
+  if (!state.windowStart || now - state.windowStart > RESTART_WINDOW_MS) {
+    state.windowStart = now;
+    state.attempts = 0;
+  }
+  if (state.attempts >= MAX_RESTARTS) {
+    await sendSubtitleToTab(tabId, {
+      type: "subtitle-status",
+      message: "Capture unstable. Please stop/start capture.",
+    });
+    return;
+  }
+  const exists = await tabExists(tabId);
+  if (!exists) {
+    clearCaptureSettings(tabId);
+    return;
+  }
+  state.attempts += 1;
+  state.inFlight = true;
+  try {
+    await sendSubtitleToTab(tabId, {
+      type: "subtitle-status",
+      message: `Reconnecting audio (${state.attempts}/${MAX_RESTARTS})...`,
+    });
+    await stopCapture(tabId);
+    await startCapture(tabId, settings.wsUrl, settings.settings);
+  } catch (err) {
+    await sendSubtitleToTab(tabId, {
+      type: "subtitle-status",
+      message: `Restart failed: ${err?.message || "unknown error"}`,
+    });
+  } finally {
+    state.inFlight = false;
+  }
+}
+
 // 發送字幕到 content script
 async function sendSubtitleToTab(tabId, payload) {
   if (!tabId) return;
@@ -124,6 +203,7 @@ function buildFallbackStatus(requestedTabId) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "popup-start") {
+    rememberCaptureSettings(message.tabId, message.wsUrl, message.settings);
     startCapture(message.tabId, message.wsUrl, message.settings)
       .then(() => sendResponse({ ok: true }))
       .catch((err) => sendResponse({ ok: false, error: err.message }));
@@ -131,6 +211,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "popup-stop") {
+    clearCaptureSettings(message.tabId);
     stopCapture(message.tabId)
       .then(() => sendResponse({ ok: true }))
       .catch((err) => sendResponse({ ok: false, error: err.message }));
@@ -171,10 +252,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "offscreen-state") {
     if (Number.isInteger(message.tabId)) {
+      const running = Boolean(message.running);
+      const statusText = message.status || (running ? "Capturing" : "Idle");
       tabStatus.set(message.tabId, {
-        running: Boolean(message.running),
-        status: message.status || (message.running ? "Capturing" : "Idle"),
+        running,
+        status: statusText,
       });
+      if (!running) {
+        const lowered = String(statusText).toLowerCase();
+        if (lowered.includes("disconnected") || lowered.includes("websocket error")) {
+          restartCapture(message.tabId, statusText);
+        }
+      }
     }
     sendResponse({ ok: true });
     return true;
@@ -195,17 +284,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           type: "subtitle",
           original: payload.original,
           translated: payload.translated,
+          final: payload.final,
           seq: payload.seq,
         });
       } else if (payload.type === "status") {
+        const msg = String(payload.message || "");
+        if (msg.toLowerCase().startsWith("stt reset")) {
+          restartCapture(tabId, msg);
+          sendResponse({ ok: true });
+          return true;
+        }
         sendSubtitleToTab(tabId, {
           type: "subtitle-status",
-          message: payload.message,
+          message: msg,
         });
       } else if (payload.type === "error") {
+        const msg = String(payload.message || "");
+        if (msg.startsWith("STT audio error")) {
+          restartCapture(tabId, msg);
+          sendResponse({ ok: true });
+          return true;
+        }
         sendSubtitleToTab(tabId, {
           type: "subtitle-status",
-          message: `Error: ${payload.message}`,
+          message: `Error: ${msg}`,
         });
       }
     }

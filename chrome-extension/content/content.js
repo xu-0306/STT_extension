@@ -9,6 +9,11 @@
   const SILENCE_CLEAR_MS = 2500; // Gap between updates to start a new utterance.
   const MAX_ORIGINAL_CHARS = 260;
   const MAX_TRANSLATED_CHARS = 260;
+  const DEFAULT_HISTORY_LINES = 2;
+  const MIN_HISTORY_LINES = 1;
+  const MAX_HISTORY_LINES = 4;
+  const HISTORY_LINES_KEY = "subtitleHistoryLines";
+  const SHOW_PARTIAL_KEY = "subtitleShowPartial";
   const MAX_SENTENCES_DEFAULT = 2;
   const MAX_SENTENCES_CJK = 1;
   const SENTENCE_ENDINGS = new Set([".", "!", "?", "。", "！", "？", "…"]);
@@ -57,7 +62,11 @@
   let overlayOpacity = DEFAULT_OVERLAY_OPACITY;
   let overlayOpacityLoaded = false;
   let lastSeq = 0;
-  let lastTranslatedSeq = 0;
+  let maxHistoryLines = DEFAULT_HISTORY_LINES;
+  let showPartialLine = true;
+  let historySettingsLoaded = false;
+  let historyLines = [];
+  let partialLine = null;
 
   function trimText(text, maxChars) {
     if (!text) return "";
@@ -71,30 +80,36 @@
     return text.replace(/\s+/g, " ").trim();
   }
 
-  function shouldApplySeq(seq) {
-    const numeric = Number(seq);
+  function clampHistoryLines(value) {
+    const numeric = Number.parseInt(value, 10);
     if (!Number.isFinite(numeric)) {
-      return true;
+      return DEFAULT_HISTORY_LINES;
     }
-    if (numeric < lastSeq) {
-      return false;
+    return Math.min(MAX_HISTORY_LINES, Math.max(MIN_HISTORY_LINES, numeric));
+  }
+
+  function normalizeShowPartial(value) {
+    if (typeof value === "boolean") {
+      return value;
     }
-    if (numeric > lastSeq) {
-      lastSeq = numeric;
+    if (typeof value === "number") {
+      return value > 0;
+    }
+    if (typeof value === "string") {
+      const lowered = value.trim().toLowerCase();
+      if (["off", "false", "0", "no"].includes(lowered)) {
+        return false;
+      }
+      if (["on", "true", "1", "yes"].includes(lowered)) {
+        return true;
+      }
     }
     return true;
   }
 
-  function shouldApplyTranslationSeq(seq) {
+  function normalizeSeq(seq) {
     const numeric = Number(seq);
-    if (!Number.isFinite(numeric)) {
-      return true;
-    }
-    if (numeric < lastTranslatedSeq) {
-      return false;
-    }
-    lastTranslatedSeq = numeric;
-    return true;
+    return Number.isFinite(numeric) ? numeric : null;
   }
 
   function splitSentences(text) {
@@ -131,15 +146,122 @@
     return trimText(normalized, maxChars);
   }
 
+  function upsertHistoryLine(seq, original, translated) {
+    if (!original && !translated) return;
+    if (seq === null) {
+      historyLines.push({ seq: null, original, translated });
+      if (historyLines.length > maxHistoryLines) {
+        historyLines.shift();
+      }
+      return;
+    }
+    const index = historyLines.findIndex((line) => line.seq === seq);
+    if (index >= 0) {
+      const line = historyLines[index];
+      if (original) {
+        line.original = original;
+      }
+      if (translated) {
+        line.translated = translated;
+      }
+      return;
+    }
+    historyLines.push({ seq, original, translated });
+    if (historyLines.length > maxHistoryLines) {
+      historyLines.shift();
+    }
+  }
+
+  function buildLineElement(text, className, placeholder) {
+    const line = document.createElement("div");
+    line.className = className;
+    if (text) {
+      line.textContent = text;
+      return line;
+    }
+    if (placeholder) {
+      line.innerHTML = "&nbsp;";
+    }
+    return line;
+  }
+
+  function renderSubtitleLines() {
+    if (!originalEl || !translatedEl) return;
+    originalEl.innerHTML = "";
+    translatedEl.innerHTML = "";
+
+    const lines = historyLines.slice(-maxHistoryLines);
+    const hasTranslations =
+      lines.some((line) => line.translated) ||
+      (showPartialLine && partialLine && partialLine.translated);
+
+    lines.forEach((line, index) => {
+      const isHistory = index < lines.length - 1;
+      const lineClass = `stt-line stt-line-final${isHistory ? " stt-line-history" : ""}`;
+      originalEl.appendChild(buildLineElement(line.original, lineClass, false));
+      if (hasTranslations) {
+        translatedEl.appendChild(buildLineElement(line.translated, lineClass, true));
+      }
+    });
+
+    if (showPartialLine && partialLine) {
+      const lineClass = "stt-line stt-line-partial";
+      originalEl.appendChild(buildLineElement(partialLine.original, lineClass, false));
+      if (hasTranslations) {
+        translatedEl.appendChild(buildLineElement(partialLine.translated, lineClass, true));
+      }
+    }
+
+    const hasOriginal =
+      lines.some((line) => line.original) ||
+      (showPartialLine && partialLine && partialLine.original);
+    originalEl.style.display = hasOriginal ? "flex" : "none";
+    translatedEl.style.display = hasTranslations ? "flex" : "none";
+  }
+
+  function applyHistoryLines(value) {
+    maxHistoryLines = clampHistoryLines(value);
+    while (historyLines.length > maxHistoryLines) {
+      historyLines.shift();
+    }
+    if (overlayEl) {
+      renderSubtitleLines();
+    }
+  }
+
+  function applyShowPartial(value) {
+    showPartialLine = normalizeShowPartial(value);
+    if (!showPartialLine) {
+      partialLine = null;
+    }
+    if (overlayEl) {
+      renderSubtitleLines();
+    }
+  }
+
+  function loadStoredHistorySettings() {
+    return new Promise((resolve) => {
+      if (!chrome?.storage?.local) {
+        resolve(null);
+        return;
+      }
+      chrome.storage.local.get([HISTORY_LINES_KEY, SHOW_PARTIAL_KEY], (result) => {
+        if (chrome.runtime.lastError) {
+          resolve(null);
+          return;
+        }
+        resolve({
+          historyLines: result[HISTORY_LINES_KEY],
+          showPartial: result[SHOW_PARTIAL_KEY],
+        });
+      });
+    });
+  }
+
   function clearSubtitleText() {
-    if (originalEl) {
-      originalEl.textContent = "";
-      originalEl.style.display = "none";
-    }
-    if (translatedEl) {
-      translatedEl.textContent = "";
-      translatedEl.style.display = "none";
-    }
+    historyLines = [];
+    partialLine = null;
+    renderSubtitleLines();
   }
 
   function getOverlayHost() {
@@ -604,6 +726,19 @@
       });
     }
 
+    if (!historySettingsLoaded) {
+      historySettingsLoaded = true;
+      loadStoredHistorySettings().then((stored) => {
+        if (!stored) return;
+        if (stored.historyLines !== undefined) {
+          applyHistoryLines(stored.historyLines);
+        }
+        if (stored.showPartial !== undefined) {
+          applyShowPartial(stored.showPartial);
+        }
+      });
+    }
+
     if (!resizeObserver && window.ResizeObserver && cardEl) {
       resizeObserver = new ResizeObserver(() => {
         syncOverlaySizeFromDom();
@@ -650,11 +785,8 @@
     overlayEl.classList.add("flash");
   }
 
-  function updateSubtitle(original, translated, seq) {
+  function updateSubtitle(original, translated, seq, isFinal) {
     console.log("[content] updateSubtitle called - overlayEl exists:", !!overlayEl);
-    if (!shouldApplySeq(seq)) {
-      return;
-    }
     if (!overlayEl) createOverlay();
     ensureOverlayHost();
 
@@ -679,43 +811,35 @@
       return;
     }
 
-    if (displayOriginal) {
-      originalEl.textContent = displayOriginal;
-      originalEl.style.display = "block";
+    const seqNumeric = normalizeSeq(seq);
+    if (seqNumeric !== null && seqNumeric > lastSeq) {
+      lastSeq = seqNumeric;
+    }
+
+    const finalFlag = isFinal === undefined ? true : Boolean(isFinal);
+    if (finalFlag) {
+      if (seqNumeric !== null && partialLine && partialLine.seq === seqNumeric) {
+        partialLine = null;
+      }
+      upsertHistoryLine(seqNumeric, displayOriginal, displayTranslated);
     } else {
-      originalEl.style.display = "none";
+      if (!showPartialLine) {
+        return;
+      }
+      if (seqNumeric !== null && seqNumeric < lastSeq) {
+        return;
+      }
+      partialLine = {
+        seq: seqNumeric,
+        original: displayOriginal,
+        translated: displayTranslated,
+      };
     }
 
-    if (displayTranslated) {
-      translatedEl.textContent = displayTranslated;
-      translatedEl.style.display = "block";
-      shouldApplyTranslationSeq(seq);
-    } else if (!translatedEl.textContent.trim()) {
-      translatedEl.style.display = "none";
-    }
-
+    renderSubtitleLines();
     statusEl.style.display = "none";
     showOverlay();
     console.log("[content] updateSubtitle done - overlay visible:", overlayEl?.classList.contains("visible"));
-  }
-
-  function updateTranslatedOnly(translated, seq) {
-    if (!translated) return;
-    if (!shouldApplyTranslationSeq(seq)) {
-      return;
-    }
-    if (!overlayEl) createOverlay();
-    ensureOverlayHost();
-
-    const displayTranslated = compactText(translated, MAX_TRANSLATED_CHARS);
-    if (!displayTranslated) {
-      return;
-    }
-
-    translatedEl.textContent = displayTranslated;
-    translatedEl.style.display = "block";
-    statusEl.style.display = "none";
-    showOverlay();
   }
 
   function updateStatus(message) {
@@ -747,7 +871,8 @@
       statusEl = null;
     }
     lastSeq = 0;
-    lastTranslatedSeq = 0;
+    historyLines = [];
+    partialLine = null;
     if (hideTimer) {
       clearTimeout(hideTimer);
       hideTimer = null;
@@ -768,14 +893,7 @@
 
     if (message.type === "subtitle") {
       console.log("[content] Updating subtitle - original:", message.original?.slice(0, 50), "translated:", message.translated?.slice(0, 50));
-      const seqValue = message.seq;
-      const seqNumeric = Number(seqValue);
-      if (Number.isFinite(seqNumeric) && seqNumeric < lastSeq && message.translated) {
-        updateTranslatedOnly(message.translated, seqValue);
-        sendResponse({ ok: true });
-        return true;
-      }
-      updateSubtitle(message.original, message.translated, message.seq);
+      updateSubtitle(message.original, message.translated, message.seq, message.final);
       sendResponse({ ok: true });
       return true;
     }
@@ -819,6 +937,21 @@
       const opacityChange = changes[OVERLAY_OPACITY_KEY];
       if (!opacityChange) return;
       applyOverlayOpacity(opacityChange.newValue ?? DEFAULT_OVERLAY_OPACITY, false);
+    });
+  }
+
+  if (chrome?.storage?.onChanged) {
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName !== "local") return;
+      const historyChange = changes[HISTORY_LINES_KEY];
+      const partialChange = changes[SHOW_PARTIAL_KEY];
+      if (!historyChange && !partialChange) return;
+      if (historyChange) {
+        applyHistoryLines(historyChange.newValue ?? DEFAULT_HISTORY_LINES);
+      }
+      if (partialChange) {
+        applyShowPartial(partialChange.newValue ?? true);
+      }
     });
   }
 

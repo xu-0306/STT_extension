@@ -51,7 +51,41 @@ ENGINE_OPTIONS = [
 SUBTITLE_MAX_CHARS_DEFAULT = 260
 SUBTITLE_MAX_SENTENCES_DEFAULT = 2
 SUBTITLE_MAX_SENTENCES_CJK = 1
+SUBTITLE_HISTORY_LINES_DEFAULT = 2
+SUBTITLE_SHOW_PARTIAL_DEFAULT = True
+MAX_CONTEXT_TOKENS_DEFAULT = 64
+STALL_TIMEOUT_DEFAULT = 15
+STALL_CHECK_INTERVAL_DEFAULT = 5
 TRANSLATION_DEBOUNCE_MS_DEFAULT = 300
+OLLAMA_KEEP_ALIVE_DEFAULT = "5m"
+
+
+def _coerce_keep_alive_value(value: object) -> Optional[object]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return OLLAMA_KEEP_ALIVE_DEFAULT if value else 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if stripped.isdigit():
+            return int(stripped)
+        return stripped
+    return None
+
+
+def _keep_alive_enabled(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    try:
+        return float(value) > 0
+    except (TypeError, ValueError):
+        return bool(str(value).strip())
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -71,6 +105,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.force_close = False
         self.backend_failed = False
         self.last_backend_error: Optional[str] = None
+        self._ollama_keep_alive_value: Optional[object] = None
 
         self._build_ui()
         self._apply_styles()
@@ -260,6 +295,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.subtitle_max_sentences_cjk_input = QtWidgets.QSpinBox()
         self.subtitle_max_sentences_cjk_input.setRange(1, 6)
         self.subtitle_max_sentences_cjk_input.setValue(SUBTITLE_MAX_SENTENCES_CJK)
+        self.subtitle_history_lines_input = QtWidgets.QSpinBox()
+        self.subtitle_history_lines_input.setRange(1, 4)
+        self.subtitle_history_lines_input.setValue(SUBTITLE_HISTORY_LINES_DEFAULT)
+        self.subtitle_show_partial_check = QtWidgets.QCheckBox("Show partial line")
         cleanup_form.addRow("Max chars", self.subtitle_max_chars_input)
         cleanup_form.addRow(
             "Max sentences (Latin)", self.subtitle_max_sentences_default_input
@@ -267,7 +306,27 @@ class MainWindow(QtWidgets.QMainWindow):
         cleanup_form.addRow(
             "Max sentences (CJK)", self.subtitle_max_sentences_cjk_input
         )
+        cleanup_form.addRow("History lines", self.subtitle_history_lines_input)
+        cleanup_form.addRow("", self.subtitle_show_partial_check)
         layout.addWidget(cleanup_group)
+
+        stability_group = QtWidgets.QGroupBox("STT stability")
+        stability_form = QtWidgets.QFormLayout(stability_group)
+        self.max_context_tokens_input = QtWidgets.QSpinBox()
+        self.max_context_tokens_input.setRange(0, 2048)
+        self.max_context_tokens_input.setValue(MAX_CONTEXT_TOKENS_DEFAULT)
+        self.stall_timeout_input = QtWidgets.QSpinBox()
+        self.stall_timeout_input.setRange(0, 300)
+        self.stall_timeout_input.setValue(STALL_TIMEOUT_DEFAULT)
+        self.stall_check_interval_input = QtWidgets.QSpinBox()
+        self.stall_check_interval_input.setRange(0, 300)
+        self.stall_check_interval_input.setValue(STALL_CHECK_INTERVAL_DEFAULT)
+        stability_form.addRow("Max context tokens", self.max_context_tokens_input)
+        stability_form.addRow("Stall timeout (sec)", self.stall_timeout_input)
+        stability_form.addRow(
+            "Stall check interval (sec)", self.stall_check_interval_input
+        )
+        layout.addWidget(stability_group)
         layout.addStretch(1)
 
         self.translation_engine_combo.currentIndexChanged.connect(self._update_engine_stack)
@@ -286,8 +345,10 @@ class MainWindow(QtWidgets.QMainWindow):
         form = QtWidgets.QFormLayout(widget)
         self.ollama_model_input = QtWidgets.QLineEdit()
         self.ollama_host_input = QtWidgets.QLineEdit()
+        self.ollama_keep_alive_check = QtWidgets.QCheckBox("Keep model warm")
         form.addRow("Ollama model", self.ollama_model_input)
         form.addRow("Ollama host", self.ollama_host_input)
+        form.addRow("", self.ollama_keep_alive_check)
         return widget
 
     def _build_engine_openai(self) -> QtWidgets.QWidget:
@@ -738,6 +799,13 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg["translation"].setdefault("ollama", {})
         cfg["translation"]["ollama"]["model"] = self.ollama_model_input.text().strip()
         cfg["translation"]["ollama"]["host"] = self.ollama_host_input.text().strip()
+        keep_alive_value = self._ollama_keep_alive_value
+        if self.ollama_keep_alive_check.isChecked():
+            if not _keep_alive_enabled(keep_alive_value):
+                keep_alive_value = OLLAMA_KEEP_ALIVE_DEFAULT
+            cfg["translation"]["ollama"]["keep_alive"] = keep_alive_value
+        else:
+            cfg["translation"]["ollama"]["keep_alive"] = 0
 
         cfg["translation"].setdefault("openai", {})
         cfg["translation"]["openai"]["model"] = self.openai_model_input.text().strip()
@@ -750,6 +818,18 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         cfg["subtitle"]["max_sentences_cjk"] = int(
             self.subtitle_max_sentences_cjk_input.value()
+        )
+        cfg["subtitle"]["history_lines"] = int(self.subtitle_history_lines_input.value())
+        cfg["subtitle"]["show_partial"] = bool(
+            self.subtitle_show_partial_check.isChecked()
+        )
+        cfg["stt"]["stall_timeout_sec"] = int(self.stall_timeout_input.value())
+        cfg["stt"]["stall_check_interval_sec"] = int(
+            self.stall_check_interval_input.value()
+        )
+        cfg["stt"].setdefault("simulstreaming", {})
+        cfg["stt"]["simulstreaming"]["max_context_tokens"] = int(
+            self.max_context_tokens_input.value()
         )
 
         return cfg
@@ -818,6 +898,12 @@ class MainWindow(QtWidgets.QMainWindow):
         ollama_cfg = translation_cfg.get("ollama", {})
         self.ollama_model_input.setText(str(ollama_cfg.get("model", "")))
         self.ollama_host_input.setText(str(ollama_cfg.get("host", "")))
+        raw_keep_alive = ollama_cfg.get("keep_alive")
+        normalized_keep_alive = _coerce_keep_alive_value(raw_keep_alive)
+        self._ollama_keep_alive_value = normalized_keep_alive
+        self.ollama_keep_alive_check.setChecked(
+            _keep_alive_enabled(normalized_keep_alive)
+        )
 
         openai_cfg = translation_cfg.get("openai", {})
         self.openai_model_input.setText(str(openai_cfg.get("model", "")))
@@ -855,6 +941,36 @@ class MainWindow(QtWidgets.QMainWindow):
             self.subtitle_max_sentences_cjk_input.setValue(
                 SUBTITLE_MAX_SENTENCES_CJK
             )
+        try:
+            self.subtitle_history_lines_input.setValue(
+                int(subtitle_cfg.get("history_lines", SUBTITLE_HISTORY_LINES_DEFAULT))
+            )
+        except (TypeError, ValueError):
+            self.subtitle_history_lines_input.setValue(SUBTITLE_HISTORY_LINES_DEFAULT)
+        self.subtitle_show_partial_check.setChecked(
+            bool(subtitle_cfg.get("show_partial", SUBTITLE_SHOW_PARTIAL_DEFAULT))
+        )
+
+        stt_cfg = cfg.get("stt", {})
+        simul_cfg = stt_cfg.get("simulstreaming", {})
+        try:
+            self.max_context_tokens_input.setValue(
+                int(simul_cfg.get("max_context_tokens", MAX_CONTEXT_TOKENS_DEFAULT))
+            )
+        except (TypeError, ValueError):
+            self.max_context_tokens_input.setValue(MAX_CONTEXT_TOKENS_DEFAULT)
+        try:
+            self.stall_timeout_input.setValue(
+                int(stt_cfg.get("stall_timeout_sec", STALL_TIMEOUT_DEFAULT))
+            )
+        except (TypeError, ValueError):
+            self.stall_timeout_input.setValue(STALL_TIMEOUT_DEFAULT)
+        try:
+            self.stall_check_interval_input.setValue(
+                int(stt_cfg.get("stall_check_interval_sec", STALL_CHECK_INTERVAL_DEFAULT))
+            )
+        except (TypeError, ValueError):
+            self.stall_check_interval_input.setValue(STALL_CHECK_INTERVAL_DEFAULT)
 
         self._update_ws_url()
 
